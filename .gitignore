@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+model/
+src/graph_verifier/data/competition_math_train/
+src/graph_verifier/data/*.tmp
