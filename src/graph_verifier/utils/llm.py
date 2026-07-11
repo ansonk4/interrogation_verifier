@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -13,32 +15,62 @@ class LLMError(RuntimeError):
 
 ROOT = Path(__file__).resolve().parents[3]
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
-DEFAULT_MODEL_CONFIG = ROOT / "model" / "openrouter" / "hy3.json"
+DEFAULT_MODEL_CONFIG = ROOT / "model" / "openrouter" / "deepseek" / "deepseek-v4-flash-high.json"
 
 
-def complete_json(prompt_name: str, data: dict[str, Any]) -> dict[str, Any]:
+def complete_json(
+    prompt_name: str,
+    data: dict[str, Any],
+    model_config: str | Path = DEFAULT_MODEL_CONFIG,
+) -> dict[str, Any]:
     prompt_path = PROMPT_DIR / prompt_name
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise LLMError(f"missing prompt {prompt_name}: {exc}") from exc
     content = prompt + "\n\nINPUT JSON:\n" + json.dumps(data, ensure_ascii=False)
-    text = complete(content)
+    start = time.perf_counter()
+    logging.info("llm start prompt=%s", prompt_name)
     try:
-        return json.loads(text)
+        text = complete(content, model_config)
+    except Exception:
+        logging.exception("llm error prompt=%s elapsed=%.2fs", prompt_name, time.perf_counter() - start)
+        raise
+    logging.info("llm end prompt=%s elapsed=%.2fs", prompt_name, time.perf_counter() - start)
+    try:
+        result = json.loads(text)
     except json.JSONDecodeError:
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise LLMError("LLM did not return JSON") from None
-        return json.loads(text[start : end + 1])
+        try:
+            result = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise LLMError("LLM did not return valid JSON") from exc
+    if not isinstance(result, dict):
+        raise LLMError("LLM JSON must be an object")
+    return result
 
 
-def complete(content: str) -> str:
+def complete_agent_json(
+    prompt_name: str,
+    data: dict[str, Any],
+    model_config: str | None,
+) -> dict[str, Any]:
+    if not model_config:
+        raise LLMError("case has no agent_model_config")
+    return complete_json(prompt_name, data, model_config)
+
+
+def complete(content: str, model_config: str | Path = DEFAULT_MODEL_CONFIG) -> str:
+    config_path = Path(model_config)
+    if not config_path.is_absolute():
+        config_path = ROOT / config_path
     try:
-        config = json.loads(DEFAULT_MODEL_CONFIG.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
     except OSError as exc:
-        raise LLMError(f"model config not found: {DEFAULT_MODEL_CONFIG}") from exc
+        raise LLMError(f"model config not found: {config_path}") from exc
     api_key = config.get("api_key")
     base_url = str(config.get("llm_url", "")).rstrip("/")
     model = config.get("model")

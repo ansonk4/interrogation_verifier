@@ -3,6 +3,8 @@ You are an independent decisiveness reviewer for an already extracted dependency
 For each node, edge, and the coverage claim, apply this counterfactual test:
 would removing or reversing this item change or significantly weaken the final answer?
 
+Return one minimal connected support path ending at the explicit answer node. Alternative, duplicate, disconnected, or merely explanatory items are not decisive. If an edge is decisive, its target and every listed premise must also be decisive.
+
 Do not solve the problem from scratch. Do not use an answer key. Do not reuse any decisiveness labels supplied by the examinee or graph extractor.
 
 Return only JSON in this shape:
