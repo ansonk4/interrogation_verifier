@@ -4,7 +4,7 @@ Address only missing concrete premises or missing rules in the current graph. Co
 
 Question-specific facts and query constraints are nodes. Ordinary mathematical definitions, operations, or theorems are never premise nodes: repair a missing rule by updating the existing edge claim so the listed premises entail its target. Do not add nodes for factorial counting, inclusion-exclusion, triangle angle sums, unit-whole conventions, or similar general rules.
 
-A new calculation may be added without an incoming edge only when it is a closed expression the local executor can check directly. A condition involving a variable, such as checking denominators after substituting `x=1`, must be the target of a new edge from the existing value and expression nodes. When an answer edge needs that check, add the calculation node, add its supporting edge, and include the calculation node in the existing answer edge's premises.
+A new node may omit an incoming edge only when it is an exact question quote or a closed expression the local executor can check directly. Every other new node MUST be the target of a new supporting edge from existing nodes. Adding that supporting edge is part of repairing the selected target and is allowed even when target_type=edge;
 
 Make the smallest possible edit. Add at most one new node and one new edge. Reuse existing node IDs and claims instead of restating them. If the target cannot be fully repaired within those limits, put the target ID in debt.
 
@@ -12,6 +12,10 @@ Focus on exactly one target from the input:
 - target_type=node means interrogate target_node only.
 - target_type=edge means interrogate target_edge only.
 - target_type=coverage means add only the missing graph items needed to make the support path explicit, or mark debt when they cannot be grounded.
+
+If rejection_reason is non-empty, your previous repair was rejected. Correct that exact defect and return the complete repair again; do not assume any part of the rejected repair was added to the graph. If rejection_reason says a new node has no provenance, return that node again and add a new edge whose target_node_id is exactly that node's ID, using existing supporting nodes as premises. Also return the update to the originally selected target. Merely changing the wording of the selected target is not a correction.
+
+For a node target with kind=query_constraint that is not an exact phrase from the question, update that existing node's claim to the shortest operative phrase copied verbatim from the question, preserving its original math notation. A direct question quote needs no incoming edge; do not add a replacement node.
 
 For an edge target missing a question constraint, add one premise node that quotes only the operative constraint phrase exactly, preserving its original math notation, and add its ID to the existing edge's premise_node_ids. Use kind=query_constraint. For example, quote `least positive integer value of $x$`, not the entire interrogative question and not the derived conclusion `the answer is 2`. Update the existing edge rule so all case-specific assumptions come from its listed premise nodes. Do not hide a new case fact inside the edge claim or replace the edge with an intermediate conclusion.
 
@@ -27,7 +31,7 @@ If a field is missing or implicit, add a concrete node or edge for it. Then upda
 - for target coverage, update the coverage claim as needed
 
 Do not create a replacement for the target:
-- support for a node target must end in an edge whose target_node_id is exactly target_id
+- support for a derived node target must end in an edge whose target_node_id is exactly target_id; an ungrounded query_constraint target is repaired by updating its claim to an exact question quote and needs no incoming edge
 - an edge target must be repaired by materially updating that existing edge ID, not by adding a parallel edge
 - a coverage repair must add or update an edge on the path to the existing answer node; rewriting coverage_claim alone is not a repair
 

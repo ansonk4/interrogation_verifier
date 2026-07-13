@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 from graph_verifier.core.models import Case, Edge, Graph, Node, Verification, answer_claim_matches
 from graph_verifier.core.verify import check_closed_calculation, check_grounding
 from graph_verifier.utils.artifacts import append_jsonl, case_name, write_json
 from graph_verifier.utils.llm import LLMError, complete_agent_json, complete_json
+
+
+class InterrogationUpdateResult(NamedTuple):
+    accepted: bool
+    rejection_reason: str
+
+    def __bool__(self) -> bool:
+        return self.accepted
 
 
 def build_graph(case: Case) -> Graph:
@@ -81,9 +90,10 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
             break
         target_type = str(target["target_type"])
         target_id = str(target["target_id"])
-        handled.add((target_type, target_id, target_signature(graph, target_type, target_id)))
+        target_key = (target_type, target_id, target_signature(graph, target_type, target_id))
         if not case.agent_model_config:
             mark_interrogation_debt(graph, target_type, target_id, "original agent unavailable")
+            handled.add(target_key)
             save_interrogation_event(
                 artifact_dir,
                 case.id,
@@ -96,57 +106,75 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
             )
             save_interrogation_graph(artifact_dir, case.id, graph)
             continue
-        try:
-            update = complete_agent_json(
-                "interrogate.md",
-                {
-                    "question": case.question,
-                    "agent_answer": case.agent_answer,
-                    "agent_reasoning": case.agent_reasoning,
-                    "graph": graph_prompt_data(graph),
-                    **target,
-                },
-                case.agent_model_config,
+        rejection_reason = ""
+        interrogation_error = False
+        for attempt in range(1, 3):
+            try:
+                update = complete_agent_json(
+                    "interrogate.md",
+                    {
+                        "question": case.question,
+                        "agent_answer": case.agent_answer,
+                        "agent_reasoning": case.agent_reasoning,
+                        "graph": graph_prompt_data(graph),
+                        "rejection_reason": rejection_reason,
+                        **target,
+                    },
+                    case.agent_model_config,
+                )
+            except (LLMError, KeyError, TypeError, ValueError) as exc:
+                graph.tool_debt.append(f"interrogation failed: {exc}")
+                save_interrogation_event(
+                    artifact_dir,
+                    case.id,
+                    {
+                        "round": round_number,
+                        "attempt": attempt,
+                        "event": "interrogate_error",
+                        "prompt": "interrogate.md",
+                        "target": target,
+                        "error": str(exc),
+                    },
+                )
+                interrogation_error = True
+                break
+            accepted, rejection_reason = apply_interrogation_update(
+                graph,
+                update,
+                question=case.question,
+                target_type=target_type,
+                target_id=target_id,
+                answer_node_ids=matching_answer_ids(case, graph),
             )
-        except (LLMError, KeyError, TypeError, ValueError) as exc:
-            graph.tool_debt.append(f"interrogation failed: {exc}")
             save_interrogation_event(
                 artifact_dir,
                 case.id,
                 {
                     "round": round_number,
-                    "event": "interrogate_error",
+                    "attempt": attempt,
+                    "event": "interrogate",
                     "prompt": "interrogate.md",
                     "target": target,
-                    "error": str(exc),
+                    "accepted": accepted,
+                    "rejection_reason": rejection_reason,
+                    "agent_model_config": case.agent_model_config,
+                    "response": update,
                 },
             )
-            break
-        accepted = apply_interrogation_update(
-            graph,
-            update,
-            question=case.question,
-            target_type=target_type,
-            target_id=target_id,
-            answer_node_ids=matching_answer_ids(case, graph),
-        )
-        save_interrogation_event(
-            artifact_dir,
-            case.id,
-            {
-                "round": round_number,
-                "event": "interrogate",
-                "prompt": "interrogate.md",
-                "target": target,
-                "accepted": accepted,
-                "rejection_reason": (
-                    "" if accepted else target_verification_reason(graph, target_type, target_id)
-                ),
-                "agent_model_config": case.agent_model_config,
-                "response": update,
-            },
-        )
+            if accepted:
+                handled.add(target_key)
+                break
+        else:
+            mark_interrogation_debt(
+                graph,
+                target_type,
+                target_id,
+                f"interrogation rejected twice: {rejection_reason}",
+            )
+            handled.add(target_key)
         save_interrogation_graph(artifact_dir, case.id, graph)
+        if interrogation_error:
+            break
     else:
         final_review: dict[str, object] | None = None
         try:
@@ -178,27 +206,23 @@ def apply_interrogation_update(
     target_type: str | None = None,
     target_id: str | None = None,
     answer_node_ids: set[str] | None = None,
-) -> bool:
+) -> InterrogationUpdateResult:
     candidate = deepcopy(graph)
     before_nodes = {node.id for node in graph.nodes}
     before_edges = {edge.id for edge in graph.edges}
     before_target = target_signature(graph, target_type, target_id)
     try:
         if target_type and target_id and target_id in debt_ids(update):
-            before = graph.to_dict()
-            mark_interrogation_debt(graph, target_type, target_id, "interrogation could not ground")
-            return graph.to_dict() != before
+            mark_interrogation_debt(candidate, target_type, target_id, "interrogation could not ground")
+            commit_graph(graph, candidate)
+            return InterrogationUpdateResult(True, "")
         apply_candidate_update(candidate, update)
-    except (KeyError, TypeError, ValueError):
-        if target_type and target_id:
-            mark_interrogation_debt(graph, target_type, target_id, "interrogation returned an invalid update")
-        return False
+    except (KeyError, TypeError, ValueError) as exc:
+        return InterrogationUpdateResult(False, f"interrogation returned an invalid update: {exc}")
 
     provenance_error = interrogation_provenance_error(question, graph, candidate)
     if provenance_error:
-        if target_type and target_id:
-            mark_interrogation_debt(graph, target_type, target_id, provenance_error)
-        return False
+        return InterrogationUpdateResult(False, provenance_error)
     tag_interrogation_sources(graph, candidate)
     changed = candidate.to_dict() != graph.to_dict()
     if target_type and target_id:
@@ -217,12 +241,11 @@ def apply_interrogation_update(
         )
         scoped = mutations_support_target(graph, candidate, target_type, target_id, answer_ids)
         if not changed or not resolved or not bounded or not connected or not scoped:
-            mark_interrogation_debt(graph, target_type, target_id, "interrogation did not resolve target")
-            return False
+            return InterrogationUpdateResult(False, "interrogation did not resolve target")
     if not changed:
-        return False
+        return InterrogationUpdateResult(False, "interrogation did not change graph")
     commit_graph(graph, candidate)
-    return True
+    return InterrogationUpdateResult(True, "")
 
 
 def interrogation_provenance_error(question: str | None, before: Graph, after: Graph) -> str | None:
@@ -233,27 +256,27 @@ def interrogation_provenance_error(question: str | None, before: Graph, after: G
     for node in after.nodes:
         if node.id in old and node_key(node) == old[node.id]:
             continue
-        grounded = check_grounding(question, node.claim, []).status == "valid" and (
-            not node.claim.rstrip().endswith("?")
-            or node.kind in {"question", "query_constraint"}
-        )
-        computable = check_closed_calculation(node.claim).status == "valid"
-        if not grounded and not computable and node.id not in supported:
+        if not node_has_provenance(question, node, supported):
             return f"interrogation node has no provenance: {node.id}"
     return None
+
+
+def node_has_provenance(question: str, node: Node, supported: set[str]) -> bool:
+    return node_is_independently_supported(question, node) or node.id in supported
+
+
+def node_is_independently_supported(question: str, node: Node) -> bool:
+    grounded = check_grounding(question, node.claim, node.sources).status == "valid" and (
+        not node.claim.rstrip().endswith("?")
+        or node.kind in {"question", "query_constraint"}
+    )
+    return grounded or check_closed_calculation(node.claim).status == "valid"
 
 
 def canonicalize_answer_node(case: Case, graph: Graph) -> None:
     answer_nodes = [node for node in graph.nodes if node.kind == "answer"]
     if len(answer_nodes) == 1 and case.agent_answer.strip():
         answer_nodes[0].claim = f"answer {case.agent_answer.strip()}"
-
-
-def target_verification_reason(graph: Graph, target_type: str, target_id: str) -> str:
-    if target_type == "coverage":
-        return graph.coverage_verification.reason
-    items = graph.nodes if target_type == "node" else graph.edges
-    return next((item.verification.reason for item in items if item.id == target_id), "")
 
 
 def tag_interrogation_sources(before: Graph, after: Graph) -> None:
@@ -573,7 +596,26 @@ def graph_prompt_data(graph: Graph) -> dict[str, object]:
 
 
 def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], list[Edge], bool, dict[str, object]]:
-    heuristic_node_ids = [node.id for node in graph.nodes if is_vague(node.claim)]
+    answer_path_nodes, _ = answer_ancestry(graph, matching_answer_ids(case, graph))
+    supported_node_ids = {edge.target_node_id for edge in graph.edges}
+    ungrounded_query_ids = [
+        node.id
+        for node in graph.nodes
+        if node.kind == "query_constraint"
+        and check_grounding(case.question, node.claim, node.sources).status != "valid"
+    ]
+    unsupported_root_ids = [
+        node.id
+        for node in graph.nodes
+        if node.id in answer_path_nodes
+        and node.kind != "answer"
+        and not node_has_provenance(case.question, node, supported_node_ids)
+    ]
+    heuristic_node_ids = merge_ids(
+        [node.id for node in graph.nodes if is_vague(node.claim)],
+        ungrounded_query_ids,
+    )
+    heuristic_node_ids = merge_ids(heuristic_node_ids, unsupported_root_ids)
     node_ids = {node.id for node in graph.nodes}
     heuristic_edge_ids = [
         edge.id
@@ -593,6 +635,14 @@ def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], li
             },
         },
     )
+    reasons = review.get("reasons", {})
+    if not isinstance(reasons, dict):
+        reasons = {}
+    for node_id in ungrounded_query_ids:
+        reasons.setdefault(node_id, "query constraint is not an exact quote from the question")
+    for node_id in unsupported_root_ids:
+        reasons.setdefault(node_id, "node has no grounded, computed, or derived provenance")
+    review = {**review, "reasons": reasons}
     node_ids = merge_ids(id_list(review, "nodes"), heuristic_node_ids)
     edge_ids = merge_ids(id_list(review, "edges"), heuristic_edge_ids)
     coverage = review.get("coverage", False)
@@ -674,6 +724,7 @@ def mark_decisive(case: Case, graph: Graph) -> Graph:
         if decisive and edge_id in edges_by_id:
             edges_by_id[edge_id].decisive = True
     prune_decisive_to_answer(case, graph)
+    complete_decisive_support(case, graph)
     graph.coverage_decisive = True
     return graph
 
@@ -702,6 +753,33 @@ def prune_decisive_to_answer(case: Case, graph: Graph) -> None:
         node.decisive = node.id in decisive_nodes
     for edge in graph.edges:
         edge.decisive = edge.id in decisive_edges
+
+
+def complete_decisive_support(case: Case, graph: Graph) -> None:
+    nodes_by_id = {node.id: node for node in graph.nodes}
+    incoming: dict[str, list[Edge]] = {}
+    for edge in graph.edges:
+        incoming.setdefault(edge.target_node_id, []).append(edge)
+    stack = [node.id for node in graph.nodes if node.decisive]
+    seen: set[str] = set()
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes_by_id[node_id]
+        if node_is_independently_supported(case.question, node):
+            continue
+        support = incoming.get(node_id, [])
+        if any(edge.decisive for edge in support) or len(support) != 1:
+            continue
+        edge = support[0]
+        edge.decisive = True
+        for premise_id in edge.premise_node_ids:
+            premise = nodes_by_id.get(premise_id)
+            if premise is not None and not premise.decisive:
+                premise.decisive = True
+                stack.append(premise_id)
 
 
 def matching_answer_ids(case: Case, graph: Graph) -> set[str]:

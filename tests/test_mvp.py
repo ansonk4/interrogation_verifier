@@ -157,6 +157,35 @@ def test_decisive_edge_forces_its_premises_decisive():
     assert all(node.decisive for node in graph.nodes)
 
 
+def test_decisive_node_pulls_in_sole_support_edge():
+    case = Case("case", "Given fraction equality, find x.", "1", "")
+    graph = Graph(
+        nodes=[
+            Node("given", "Given fraction equality", "query_constraint"),
+            Node("derived", "denominators are nonzero", "constraint"),
+            Node("answer", "answer 1", "answer"),
+        ],
+        edges=[
+            Edge("support", ["given"], "derived", "fractions require nonzero denominators"),
+            Edge("finish", ["derived"], "answer", "therefore answer 1"),
+        ],
+    )
+    review = {
+        "nodes": {"given": True, "derived": True, "answer": True},
+        "edges": {"support": False, "finish": True},
+        "coverage": True,
+        "reasons": {},
+    }
+    with patch("graph_verifier.core.graph.complete_json", return_value=review):
+        mark_decisive(case, graph)
+
+    assert all(node.decisive for node in graph.nodes)
+    assert all(edge.decisive for edge in graph.edges)
+
+    verify_graph(case, graph, lambda *args: ClaimCheck("valid", "support"))
+    assert final_status(graph).status == "verified_reliable"
+
+
 def test_interrogation_unsupported_premise_is_debt_not_refutation():
     graph = Graph(
         nodes=[
@@ -264,6 +293,10 @@ def test_interrogation_uses_llm_targets():
         assert model_config == AGENT_MODEL_CONFIG
         assert data["target_type"] in {"node", "edge", "coverage"}
         assert data["target_id"] in {"n1", "e1", "coverage"}
+        if len([call for call, _ in calls if call == "interrogate.md"]) == 1:
+            assert data["rejection_reason"] == ""
+        else:
+            assert data["rejection_reason"] == "interrogation did not resolve target"
         return {
             "new_nodes": (
                 [{"id": "n3", "claim": "100 / 40 = 2.5", "kind": "calculation"}]
@@ -283,13 +316,17 @@ def test_interrogation_uses_llm_targets():
     assert [prompt_name for prompt_name, _ in calls] == [
         "interrogation_targets.md",
         "interrogate.md",
+        "interrogate.md",
         "interrogation_targets.md",
     ]
     assert [data["target_type"] for prompt_name, data in calls if prompt_name == "interrogate.md"] == [
         "node",
+        "node",
     ]
     assert [node.id for node in graph.nodes] == ["n1", "n2"]
-    assert graph.nodes[0].verification.reason == "interrogation did not resolve target"
+    assert graph.nodes[0].verification.reason == (
+        "interrogation rejected twice: interrogation did not resolve target"
+    )
 
 
 def test_interrogation_update_mutates_existing_targets():
@@ -394,6 +431,132 @@ def test_interrogation_target_selection_sees_updates():
     assert graph.nodes[-1].sources == ["interrogation"]
 
 
+def test_interrogation_repairs_ungrounded_query_constraint():
+    question = (
+        r"For what value of $x$ will $\frac{3+x}{5+x}$ and "
+        r"$\frac{1+x}{2+x}$ be equal?"
+    )
+    exact_claim = r"$\frac{3+x}{5+x}$ and $\frac{1+x}{2+x}$ be equal"
+    case = Case(
+        "case",
+        question,
+        "1",
+        "Set the fractions equal and solve x = 1.",
+        agent_model_config=AGENT_MODEL_CONFIG,
+    )
+    graph = Graph(
+        nodes=[
+            Node("n1", "frac{3+x}{5+x} = frac{1+x}{2+x}", "query_constraint"),
+            Node("answer", "answer 1", "answer"),
+        ],
+        edges=[Edge("e1", ["n1"], "answer", "solve for x")],
+    )
+    reviewer_calls = 0
+    agent_calls = 0
+
+    def fake_reviewer(prompt_name, data):
+        nonlocal reviewer_calls
+        assert prompt_name == "interrogation_targets.md"
+        reviewer_calls += 1
+        assert data["heuristic_targets"]["nodes"] == (["n1"] if reviewer_calls == 1 else [])
+        return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
+
+    def fake_agent(prompt_name, data, model_config):
+        nonlocal agent_calls
+        assert prompt_name == "interrogate.md"
+        assert model_config == AGENT_MODEL_CONFIG
+        assert data["target_type"] == "node"
+        assert data["target_id"] == "n1"
+        assert data["target_reason"] == "query constraint is not an exact quote from the question"
+        agent_calls += 1
+        return {
+            "new_nodes": [],
+            "new_edges": [],
+            "updates": [{"id": "n1", "claim": exact_claim, "kind": "query_constraint"}],
+            "debt": [],
+        }
+
+    with (
+        patch("graph_verifier.core.graph.complete_json", side_effect=fake_reviewer),
+        patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
+    ):
+        interrogate(case, graph)
+
+    assert reviewer_calls == 2
+    assert agent_calls == 1
+    assert graph.nodes[0].claim == exact_claim
+    assert graph.nodes[0].sources == ["interrogation"]
+
+
+def test_interrogation_repairs_unsupported_root_on_answer_path():
+    question = (
+        r"For what value of $x$ will $\frac{3+x}{5+x}$ and "
+        r"$\frac{1+x}{2+x}$ be equal?"
+    )
+    case = Case(
+        "case",
+        question,
+        "1",
+        "Set the fractions equal and solve x = 1.",
+        agent_model_config=AGENT_MODEL_CONFIG,
+    )
+    graph = Graph(
+        nodes=[
+            Node(
+                "n1",
+                r"$\frac{3+x}{5+x}$ and $\frac{1+x}{2+x}$ be equal",
+                "query_constraint",
+            ),
+            Node("n2", "Denominators 5+x and 2+x are nonzero", "constraint"),
+            Node("n3", "(3+x)(2+x) = (1+x)(5+x)", "calculation"),
+            Node("answer", "answer 1", "answer"),
+            Node("unused", "z is positive", "constraint"),
+        ],
+        edges=[
+            Edge("e1", ["n1", "n2"], "n3", "cross multiply"),
+            Edge("e2", ["n3"], "answer", "solve x=1"),
+        ],
+    )
+    reviewer_calls = 0
+
+    def fake_reviewer(prompt_name, data):
+        nonlocal reviewer_calls
+        assert prompt_name == "interrogation_targets.md"
+        reviewer_calls += 1
+        assert data["heuristic_targets"]["nodes"] == (["n2"] if reviewer_calls == 1 else [])
+        return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
+
+    def fake_agent(prompt_name, data, model_config):
+        assert prompt_name == "interrogate.md"
+        assert model_config == AGENT_MODEL_CONFIG
+        assert data["target_type"] == "node"
+        assert data["target_id"] == "n2"
+        assert data["target_reason"] == "node has no grounded, computed, or derived provenance"
+        return {
+            "new_nodes": [],
+            "new_edges": [
+                {
+                    "id": "e0",
+                    "premise_node_ids": ["n1"],
+                    "target_node_id": "n2",
+                    "claim": "fractions are defined only when their denominators are nonzero",
+                }
+            ],
+            "updates": [],
+            "debt": [],
+        }
+
+    with (
+        patch("graph_verifier.core.graph.complete_json", side_effect=fake_reviewer),
+        patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
+    ):
+        interrogate(case, graph)
+
+    assert reviewer_calls == 2
+    assert graph.edges[-1].id == "e0"
+    assert graph.edges[-1].target_node_id == "n2"
+
+
 def test_changed_edge_can_be_refined():
     case = Case(
         "case",
@@ -493,16 +656,100 @@ def test_interrogation_rejects_node_without_provenance():
         "debt": [],
     }
 
-    assert not apply_interrogation_update(
+    result = apply_interrogation_update(
         graph,
         update,
         question=question,
         target_type="edge",
         target_id="e2",
     )
+    assert not result
+    assert result.rejection_reason == "interrogation node has no provenance: unsupported"
     assert [node.id for node in graph.nodes] == ["n2", "n4", "answer"]
     assert graph.edges[0].premise_node_ids == ["n2", "n4"]
-    assert graph.edges[0].verification.reason == "interrogation node has no provenance: unsupported"
+    assert graph.edges[0].verification.reason == ""
+
+
+def test_interrogation_retries_orphan_node_with_rejection_reason():
+    case = Case(
+        "case",
+        "Given x = 1 and the denominators are 5+x and 2+x, determine whether they are nonzero.",
+        "1",
+        "x = 1; the denominators are nonzero.",
+        agent_model_config=AGENT_MODEL_CONFIG,
+    )
+    graph = Graph(
+        nodes=[
+            Node("n1", "the denominators are 5+x and 2+x", "premise"),
+            Node("n4", "x = 1", "calculation"),
+            Node("answer", "answer 1", "answer"),
+        ],
+        edges=[Edge("e4", ["n4"], "answer", "therefore answer 1")],
+    )
+    reviewer_calls = 0
+    agent_calls = 0
+
+    def fake_reviewer(prompt_name, data):
+        nonlocal reviewer_calls
+        assert prompt_name == "interrogation_targets.md"
+        reviewer_calls += 1
+        if reviewer_calls == 1:
+            return {"nodes": [], "edges": ["e4"], "coverage": False, "reasons": {}}
+        return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
+
+    def fake_agent(prompt_name, data, model_config):
+        nonlocal agent_calls
+        assert prompt_name == "interrogate.md"
+        assert model_config == AGENT_MODEL_CONFIG
+        agent_calls += 1
+        update = {
+            "new_nodes": [
+                {
+                    "id": "n7",
+                    "claim": "Denominators (5+1 and 2+1) are nonzero",
+                    "kind": "calculation",
+                }
+            ],
+            "new_edges": [],
+            "updates": [
+                {
+                    "id": "e4",
+                    "premise_node_ids": ["n4", "n7"],
+                    "target_node_id": "answer",
+                    "claim": "x=1 has nonzero denominators, so answer 1",
+                }
+            ],
+            "debt": [],
+        }
+        if agent_calls == 1:
+            assert data["rejection_reason"] == ""
+            return update
+        assert data["rejection_reason"] == "interrogation node has no provenance: n7"
+        return {
+            **update,
+            "new_edges": [
+                {
+                    "id": "e5",
+                    "premise_node_ids": ["n1", "n4"],
+                    "target_node_id": "n7",
+                    "claim": "substitute x=1 into 5+x and 2+x",
+                }
+            ],
+        }
+
+    with (
+        patch("graph_verifier.core.graph.complete_json", side_effect=fake_reviewer),
+        patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
+    ):
+        interrogate(case, graph)
+
+    assert agent_calls == 2
+    assert [node.id for node in graph.nodes] == ["n1", "n4", "answer", "n7"]
+    assert [edge.id for edge in graph.edges] == ["e4", "e5"]
+    assert graph.edges[0].premise_node_ids == ["n4", "n7"]
+    assert graph.edges[1].premise_node_ids == ["n1", "n4"]
+    assert graph.edges[1].target_node_id == "n7"
+    assert graph.edges[0].verification.reason == ""
 
 
 def test_interrogation_accepts_all_provenance_receipts():
@@ -676,11 +923,14 @@ def test_supplied_decisive_labels_are_ignored():
             "coverage_decisive": False,
         }
     )
+    assert not any(node.decisive for node in graph.nodes)
+    assert not any(edge.decisive for edge in graph.edges)
+    assert graph.coverage_decisive
+
     review = {"nodes": {"n1": False, "n2": False}, "edges": {"e1": False}, "coverage": True, "reasons": {}}
     assert status_for(graph, review=review) == "coverage_debt"
-    assert not graph.nodes[0].decisive
-    assert graph.nodes[1].decisive
-    assert not graph.edges[0].decisive
+    assert all(node.decisive for node in graph.nodes)
+    assert graph.edges[0].decisive
     assert graph.coverage_decisive
 
 
@@ -1099,9 +1349,11 @@ def test_unconnected_target_repair_is_rolled_back():
         "updates": [],
         "debt": [],
     }
-    assert not apply_interrogation_update(graph, update, target_type="node", target_id="target")
+    result = apply_interrogation_update(graph, update, target_type="node", target_id="target")
+    assert not result
+    assert result.rejection_reason == "interrogation did not resolve target"
     assert [node.id for node in graph.nodes] == ["target", "answer"]
-    assert graph.nodes[0].verification.reason == "interrogation did not resolve target"
+    assert graph.nodes[0].verification.reason == ""
 
 
 def test_explicit_target_debt_discards_extra_edits():
@@ -1125,9 +1377,11 @@ def test_coverage_claim_only_is_not_a_repair():
         "updates": [{"id": "coverage", "coverage_claim": "looks complete"}],
         "debt": [],
     }
-    assert not apply_interrogation_update(graph, update, target_type="coverage", target_id="coverage")
+    result = apply_interrogation_update(graph, update, target_type="coverage", target_id="coverage")
+    assert not result
+    assert result.rejection_reason == "interrogation did not resolve target"
     assert graph.coverage_claim == "missing"
-    assert graph.coverage_verification.reason == "interrogation did not resolve target"
+    assert graph.coverage_verification.reason == ""
 
 
 def test_coverage_repair_cannot_add_a_different_answer_branch():
@@ -1297,14 +1551,18 @@ if __name__ == "__main__":
         test_irrelevant_true_edge_does_not_support_answer,
         test_edge_cannot_use_numbers_missing_from_premises,
         test_decisive_edge_forces_its_premises_decisive,
+        test_decisive_node_pulls_in_sole_support_edge,
         test_interrogation_unsupported_premise_is_debt_not_refutation,
         test_interrogation_without_original_agent_marks_debt,
         test_coverage_gap_anchors_to_only_answer_edge,
         test_interrogation_uses_llm_targets,
         test_interrogation_update_mutates_existing_targets,
         test_interrogation_target_selection_sees_updates,
+        test_interrogation_repairs_ungrounded_query_constraint,
+        test_interrogation_repairs_unsupported_root_on_answer_path,
         test_changed_edge_can_be_refined,
         test_interrogation_rejects_node_without_provenance,
+        test_interrogation_retries_orphan_node_with_rejection_reason,
         test_interrogation_accepts_all_provenance_receipts,
         test_interrogation_stops_at_max_rounds,
         test_interrogation_reports_debt_when_targets_remain_after_max_rounds,
