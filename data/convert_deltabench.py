@@ -199,11 +199,15 @@ def main() -> None:
     with SOURCE.open(encoding="utf-8") as source:
         items = [json.loads(line) for line in source if line.strip()]
     with ThreadPoolExecutor(max_workers=6) as executor:
-        cases = list(executor.map(convert, enumerate(items)))
+        cases = [
+            case
+            for case in executor.map(convert, enumerate(items))
+            if case["agent_answer"].strip()
+        ]
     with OUTPUT.open("w", encoding="utf-8") as output:
         for case in cases:
             output.write(json.dumps(case, ensure_ascii=False, sort_keys=True) + "\n")
-    print(f"{OUTPUT}: {len(cases)} cases")
+    print(f"{OUTPUT}: {len(cases)} cases; skipped {len(items) - len(cases)} without explicit answers")
 
 
 if __name__ == "__main__":
