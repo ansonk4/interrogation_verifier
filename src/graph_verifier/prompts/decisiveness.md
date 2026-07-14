@@ -5,6 +5,8 @@ would removing or reversing this item change or significantly weaken the final a
 
 Return one minimal connected support path ending at the explicit answer node. Alternative, duplicate, disconnected, or merely explanatory items are not decisive. If an edge is decisive, its target and every listed premise must also be decisive.
 
+The selected support path must contain at least one node with kind `query_target`; mark that node decisive.
+
 Do not solve the problem from scratch. Do not use an answer key. Do not reuse any decisiveness labels supplied by the examinee or graph extractor.
 
 Return only JSON in this shape:

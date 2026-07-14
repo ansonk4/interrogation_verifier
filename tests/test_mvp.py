@@ -1,4 +1,6 @@
 from fractions import Fraction
+from pathlib import Path
+from threading import Barrier, Lock
 from unittest.mock import patch
 
 from graph_verifier.core.aggregate import final_status
@@ -8,7 +10,7 @@ from graph_verifier.core.graph import (
     interrogate,
     mark_decisive,
 )
-from graph_verifier.core.models import Case, Edge, Graph, Node, Verification
+from graph_verifier.core.models import QUERY_TARGET, Case, Edge, Graph, Node, Verification
 from graph_verifier.core.verify import (
     ClaimCheck,
     check_closed_calculation,
@@ -18,17 +20,21 @@ from graph_verifier.core.verify import (
     verify_edge_with_llm,
     verify_graph,
 )
-from graph_verifier.main import compact_output
-from graph_verifier.utils.llm import LLMError
+from graph_verifier.main import compact_output, process_cases, validate_case_names
+from graph_verifier.utils.llm import LLMError, complete_json
 
 
-QUESTION = "Provider A costs 100 dollars for 40 units. Provider B costs 90 dollars for 30 units."
-AGENT_MODEL_CONFIG = "model/openrouter/deepseek/deepseek-v4-flash-high.json"
+QUESTION = (
+    "Provider A costs 100 dollars for 40 units. "
+    "Provider B costs 90 dollars for 30 units. Which provider is cheaper?"
+)
+AGENT_MODEL_CONFIG = "model/openrouter/hy3.json"
 
 
 def complete_graph(comparison: str = "2.5 < 3", answer: str = "A") -> Graph:
     return Graph(
         nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET, ["question"]),
             Node("n1", "100 / 40 = 2.5", "calculation"),
             Node("n2", "90 / 30 = 3", "calculation"),
             Node("n3", comparison, "comparison"),
@@ -38,7 +44,7 @@ def complete_graph(comparison: str = "2.5 < 3", answer: str = "A") -> Graph:
             Edge("e1", ["n1", "n2"], "n3", comparison),
             Edge(
                 "e2",
-                ["n1", "n2", "n3"],
+                ["query", "n1", "n2", "n3"],
                 "n4",
                 f"Provider A costs 2.5 per unit, Provider B costs 3, and {comparison}, so answer {answer}",
             ),
@@ -161,17 +167,18 @@ def test_decisive_node_pulls_in_sole_support_edge():
     case = Case("case", "Given fraction equality, find x.", "1", "")
     graph = Graph(
         nodes=[
+            Node("query", "x", QUERY_TARGET),
             Node("given", "Given fraction equality", "query_constraint"),
             Node("derived", "denominators are nonzero", "constraint"),
             Node("answer", "answer 1", "answer"),
         ],
         edges=[
             Edge("support", ["given"], "derived", "fractions require nonzero denominators"),
-            Edge("finish", ["derived"], "answer", "therefore answer 1"),
+            Edge("finish", ["query", "derived"], "answer", "therefore answer 1"),
         ],
     )
     review = {
-        "nodes": {"given": True, "derived": True, "answer": True},
+        "nodes": {"query": True, "given": True, "derived": True, "answer": True},
         "edges": {"support": False, "finish": True},
         "coverage": True,
         "reasons": {},
@@ -227,10 +234,11 @@ def test_coverage_gap_anchors_to_only_answer_edge():
     case = Case("case", "Find the least positive integer x with x > 1", "2", "x > 1, so 2")
     graph = Graph(
         nodes=[
+            Node("query", "x", QUERY_TARGET),
             Node("n1", "x > 1", "calculation"),
             Node("answer", "answer 2", "answer"),
         ],
-        edges=[Edge("answer_edge", ["n1"], "answer", "therefore answer 2")],
+        edges=[Edge("answer_edge", ["query", "n1"], "answer", "therefore answer 2")],
         coverage_claim="n1 -> answer_edge -> answer",
     )
     target_calls = 0
@@ -269,10 +277,11 @@ def test_interrogation_uses_llm_targets():
     )
     graph = Graph(
         nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET),
             Node("n1", "Provider A is cheaper", "claim"),
             Node("n2", "answer A", "answer"),
         ],
-        edges=[Edge("e1", ["n1"], "n2", "A is the answer")],
+        edges=[Edge("e1", ["query", "n1"], "n2", "A is the answer")],
         coverage_claim="n1 -> e1 -> n2",
     )
     calls = []
@@ -323,8 +332,8 @@ def test_interrogation_uses_llm_targets():
         "node",
         "node",
     ]
-    assert [node.id for node in graph.nodes] == ["n1", "n2"]
-    assert graph.nodes[0].verification.reason == (
+    assert [node.id for node in graph.nodes] == ["query", "n1", "n2"]
+    assert graph.nodes[1].verification.reason == (
         "interrogation rejected twice: interrogation did not resolve target"
     )
 
@@ -381,10 +390,11 @@ def test_interrogation_target_selection_sees_updates():
     )
     graph = Graph(
         nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET),
             Node("n1", "Provider A costs 100 dollars for 40 units", "premise"),
             Node("n2", "answer A", "answer"),
         ],
-        edges=[Edge("e1", ["n1"], "n2", "A is cheaper")],
+        edges=[Edge("e1", ["query", "n1"], "n2", "A is cheaper")],
         coverage_claim="n1 -> e1 -> n2",
     )
     target_calls = 0
@@ -395,7 +405,7 @@ def test_interrogation_target_selection_sees_updates():
         target_calls += 1
         if target_calls == 1:
             return {"nodes": [], "edges": ["e1"], "coverage": False, "reasons": {}}
-        assert data["graph"]["edges"][0]["premise_node_ids"] == ["n1", "n3"]
+        assert data["graph"]["edges"][0]["premise_node_ids"] == ["n1", "n3", "query"]
         assert data["graph"]["edges"][0]["target_node_id"] == "n2"
         assert data["graph"]["edges"][0]["claim"] == "Provider A is cheaper, so answer A"
         return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
@@ -411,7 +421,7 @@ def test_interrogation_target_selection_sees_updates():
             "updates": [
                 {
                     "id": "e1",
-                    "premise_node_ids": ["n1", "n3"],
+                    "premise_node_ids": ["query", "n1", "n3"],
                     "target_node_id": "n2",
                     "claim": "Provider A is cheaper, so answer A",
                 }
@@ -426,12 +436,12 @@ def test_interrogation_target_selection_sees_updates():
         interrogate(case, graph)
 
     assert target_calls == 2
-    assert graph.edges[0].premise_node_ids == ["n1", "n3"]
+    assert graph.edges[0].premise_node_ids == ["n1", "n3", "query"]
     assert graph.edges[0].target_node_id == "n2"
     assert graph.nodes[-1].sources == ["interrogation"]
 
 
-def test_interrogation_repairs_ungrounded_query_constraint():
+def test_interrogation_repairs_ungrounded_query_target():
     question = (
         r"For what value of $x$ will $\frac{3+x}{5+x}$ and "
         r"$\frac{1+x}{2+x}$ be equal?"
@@ -446,7 +456,7 @@ def test_interrogation_repairs_ungrounded_query_constraint():
     )
     graph = Graph(
         nodes=[
-            Node("n1", "frac{3+x}{5+x} = frac{1+x}{2+x}", "query_constraint"),
+            Node("n1", "frac{3+x}{5+x} = frac{1+x}{2+x}", QUERY_TARGET),
             Node("answer", "answer 1", "answer"),
         ],
         edges=[Edge("e1", ["n1"], "answer", "solve for x")],
@@ -458,7 +468,7 @@ def test_interrogation_repairs_ungrounded_query_constraint():
         nonlocal reviewer_calls
         assert prompt_name == "interrogation_targets.md"
         reviewer_calls += 1
-        assert data["heuristic_targets"]["nodes"] == (["n1"] if reviewer_calls == 1 else [])
+        assert data["heuristic_targets"]["nodes"] == []
         return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
 
     def fake_agent(prompt_name, data, model_config):
@@ -467,12 +477,12 @@ def test_interrogation_repairs_ungrounded_query_constraint():
         assert model_config == AGENT_MODEL_CONFIG
         assert data["target_type"] == "node"
         assert data["target_id"] == "n1"
-        assert data["target_reason"] == "query constraint is not an exact quote from the question"
+        assert data["target_reason"] == "query target is not an exact quote from the question"
         agent_calls += 1
         return {
             "new_nodes": [],
             "new_edges": [],
-            "updates": [{"id": "n1", "claim": exact_claim, "kind": "query_constraint"}],
+            "updates": [{"id": "n1", "claim": exact_claim, "kind": QUERY_TARGET}],
             "debt": [],
         }
 
@@ -482,7 +492,7 @@ def test_interrogation_repairs_ungrounded_query_constraint():
     ):
         interrogate(case, graph)
 
-    assert reviewer_calls == 2
+    assert reviewer_calls == 1
     assert agent_calls == 1
     assert graph.nodes[0].claim == exact_claim
     assert graph.nodes[0].sources == ["interrogation"]
@@ -505,7 +515,7 @@ def test_interrogation_repairs_unsupported_root_on_answer_path():
             Node(
                 "n1",
                 r"$\frac{3+x}{5+x}$ and $\frac{1+x}{2+x}$ be equal",
-                "query_constraint",
+                QUERY_TARGET,
             ),
             Node("n2", "Denominators 5+x and 2+x are nonzero", "constraint"),
             Node("n3", "(3+x)(2+x) = (1+x)(5+x)", "calculation"),
@@ -566,8 +576,12 @@ def test_changed_edge_can_be_refined():
         agent_model_config=AGENT_MODEL_CONFIG,
     )
     graph = Graph(
-        nodes=[Node("given", "100 / 40 = 2.5"), Node("answer", "answer A", "answer")],
-        edges=[Edge("edge", ["given"], "answer", "therefore A")],
+        nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET),
+            Node("given", "100 / 40 = 2.5"),
+            Node("answer", "answer A", "answer"),
+        ],
+        edges=[Edge("edge", ["query", "given"], "answer", "therefore A")],
     )
     target_calls = 0
     agent_calls = 0
@@ -595,7 +609,7 @@ def test_changed_edge_can_be_refined():
                 "updates": [
                     {
                         "id": "edge",
-                        "premise_node_ids": ["given", "constraint"],
+                        "premise_node_ids": ["query", "given", "constraint"],
                         "target_node_id": "answer",
                         "claim": "therefore A",
                     }
@@ -608,7 +622,7 @@ def test_changed_edge_can_be_refined():
             "updates": [
                 {
                     "id": "edge",
-                    "premise_node_ids": ["given", "constraint"],
+                    "premise_node_ids": ["query", "given", "constraint"],
                     "target_node_id": "answer",
                     "claim": "2.5 is the lower unit price, so answer A",
                 }
@@ -680,11 +694,12 @@ def test_interrogation_retries_orphan_node_with_rejection_reason():
     )
     graph = Graph(
         nodes=[
+            Node("query", "whether they are nonzero", QUERY_TARGET),
             Node("n1", "the denominators are 5+x and 2+x", "premise"),
             Node("n4", "x = 1", "calculation"),
             Node("answer", "answer 1", "answer"),
         ],
-        edges=[Edge("e4", ["n4"], "answer", "therefore answer 1")],
+        edges=[Edge("e4", ["query", "n4"], "answer", "therefore answer 1")],
     )
     reviewer_calls = 0
     agent_calls = 0
@@ -714,7 +729,7 @@ def test_interrogation_retries_orphan_node_with_rejection_reason():
             "updates": [
                 {
                     "id": "e4",
-                    "premise_node_ids": ["n4", "n7"],
+                    "premise_node_ids": ["query", "n4", "n7"],
                     "target_node_id": "answer",
                     "claim": "x=1 has nonzero denominators, so answer 1",
                 }
@@ -744,9 +759,9 @@ def test_interrogation_retries_orphan_node_with_rejection_reason():
         interrogate(case, graph)
 
     assert agent_calls == 2
-    assert [node.id for node in graph.nodes] == ["n1", "n4", "answer", "n7"]
+    assert [node.id for node in graph.nodes] == ["query", "n1", "n4", "answer", "n7"]
     assert [edge.id for edge in graph.edges] == ["e4", "e5"]
-    assert graph.edges[0].premise_node_ids == ["n4", "n7"]
+    assert graph.edges[0].premise_node_ids == ["n4", "n7", "query"]
     assert graph.edges[1].premise_node_ids == ["n1", "n4"]
     assert graph.edges[1].target_node_id == "n7"
     assert graph.edges[0].verification.reason == ""
@@ -1197,7 +1212,7 @@ def test_closed_math_does_not_depend_on_extractor_kind():
 def test_verified_result_can_map_to_canonical_answer():
     graph = Graph(
         nodes=[
-            Node("given", "Find a", "query_constraint", decisive=True),
+            Node("given", "a", QUERY_TARGET, decisive=True),
             Node("result", "a = 4", "calculation", decisive=True),
             Node("answer", "answer 4", "answer", decisive=True),
         ],
@@ -1522,6 +1537,174 @@ def test_coverage_rejects_numeric_answer_prefixes_and_fractions():
         assert verify_coverage(case, graph).status == "debt"
 
 
+def test_coverage_requires_a_query_target():
+    case = Case("case", "What is 1 + 1?", "2", "")
+    graph = Graph(
+        nodes=[
+            Node(
+                "premise",
+                "1 + 1 = 2",
+                "calculation",
+                decisive=True,
+                verification=Verification("valid", "computed"),
+            ),
+            Node(
+                "answer",
+                "answer 2",
+                "answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            ),
+        ],
+        edges=[
+            Edge(
+                "finish",
+                ["premise"],
+                "answer",
+                "the computed value is the answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            )
+        ],
+    )
+
+    coverage = verify_coverage(case, graph)
+    assert coverage.status == "debt"
+    assert coverage.reason == "missing query target"
+
+
+def test_coverage_requires_query_target_on_answer_path():
+    case = Case("case", "What is 1 + 1?", "2", "")
+    graph = Graph(
+        nodes=[
+            Node(
+                "query",
+                "1 + 1",
+                QUERY_TARGET,
+                verification=Verification("valid", "grounded"),
+            ),
+            Node(
+                "premise",
+                "1 + 1 = 2",
+                "calculation",
+                decisive=True,
+                verification=Verification("valid", "computed"),
+            ),
+            Node(
+                "answer",
+                "answer 2",
+                "answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            ),
+        ],
+        edges=[
+            Edge(
+                "finish",
+                ["premise"],
+                "answer",
+                "the computed value is the answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            )
+        ],
+    )
+
+    coverage = verify_coverage(case, graph)
+    assert coverage.status == "debt"
+    assert coverage.reason == "query target not on valid answer path"
+
+
+def test_missing_query_target_is_deterministically_repaired():
+    case = Case(
+        "case",
+        "Find the value of the first term in the geometric sequence a,b,c,32,64.",
+        "4",
+        "The ratio is 2, so a = 4.",
+        agent_model_config=AGENT_MODEL_CONFIG,
+    )
+    graph = Graph(
+        nodes=[
+            Node("q1", "the geometric sequence a,b,c,32,64", "query_constraint"),
+            Node("n5", "32 / 8 = 4", "calculation"),
+            Node("answer", "answer 4", "answer"),
+        ],
+        edges=[Edge("e6", ["q1", "n5"], "answer", "a is 4, so answer 4")],
+    )
+    reviewer_calls = 0
+    agent_calls = 0
+
+    def fake_reviewer(prompt_name, data):
+        nonlocal reviewer_calls
+        reviewer_calls += 1
+        assert prompt_name == "interrogation_targets.md"
+        assert any(node["kind"] == QUERY_TARGET for node in data["graph"]["nodes"])
+        return {"nodes": [], "edges": [], "coverage": False, "reasons": {}}
+
+    def fake_agent(prompt_name, data, model_config):
+        nonlocal agent_calls
+        agent_calls += 1
+        assert prompt_name == "interrogate.md"
+        assert model_config == AGENT_MODEL_CONFIG
+        assert data["target_type"] == "edge"
+        assert data["target_id"] == "e6"
+        assert data["target_reason"] == "missing dedicated query target"
+        return {
+            "new_nodes": [
+                {
+                    "id": "q_target",
+                    "claim": "the value of the first term",
+                    "kind": QUERY_TARGET,
+                    "sources": ["question"],
+                }
+            ],
+            "new_edges": [],
+            "updates": [
+                {
+                    "id": "e6",
+                    "premise_node_ids": ["q1", "n5", "q_target"],
+                    "target_node_id": "answer",
+                    "claim": "a is the first term and equals 4, which is the requested value",
+                }
+            ],
+            "debt": [],
+        }
+
+    with (
+        patch("graph_verifier.core.graph.complete_json", side_effect=fake_reviewer),
+        patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
+    ):
+        interrogate(case, graph)
+
+    assert reviewer_calls == 1
+    assert agent_calls == 1
+    assert graph.tool_debt == []
+    assert {node.id for node in graph.nodes if node.kind == QUERY_TARGET} == {"q_target"}
+    assert set(graph.edges[0].premise_node_ids) == {"q1", "n5", "q_target"}
+
+    for node in graph.nodes:
+        node.decisive = True
+    for edge in graph.edges:
+        edge.decisive = True
+    verify_graph(case, graph, lambda *args: ClaimCheck("valid", "supported"))
+    assert graph.coverage_verification.status == "valid"
+
+
+def test_complete_json_retries_a_malformed_response():
+    calls = 0
+
+    def fake_complete(content, model_config):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LLMError("malformed endpoint JSON")
+        return '{"ok": true}'
+
+    with patch("graph_verifier.utils.llm.complete", side_effect=fake_complete):
+        assert complete_json("graph_extract.md", {}, attempts=2) == {"ok": True}
+    assert calls == 2
+
+
 def test_compact_output_counts_only_decisive_items():
     graph = Graph(
         nodes=[
@@ -1541,6 +1724,58 @@ def test_compact_output_counts_tool_debt():
     assert output["debt"] == 1
 
 
+def test_case_processing_is_concurrent_bounded_and_ordered():
+    cases = [
+        Case("first", "q", "a", ""),
+        Case("second", "q", "a", ""),
+        Case("third", "q", "a", ""),
+    ]
+    barrier = Barrier(2)
+    lock = Lock()
+    active = 0
+    peak = 0
+
+    def fake_process(case, *, mode, artifact_dir, max_interrogation_rounds):
+        nonlocal active, peak
+        assert mode == "interrogation"
+        assert artifact_dir == Path("artifacts")
+        assert max_interrogation_rounds == 3
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if case.id != "third":
+                barrier.wait(timeout=2)
+            return {"id": case.id, "status": "verification_debt"}
+        finally:
+            with lock:
+                active -= 1
+
+    with patch("graph_verifier.main.process_case", side_effect=fake_process):
+        outputs = list(process_cases(cases, "interrogation", Path("artifacts"), 3, 2))
+
+    assert peak == 2
+    assert [output["id"] for output in outputs] == ["first", "second", "third"]
+
+
+def test_case_processing_rejects_invalid_concurrency():
+    try:
+        list(process_cases([], "interrogation", Path("artifacts"), 3, 0))
+    except ValueError as exc:
+        assert "concurrency" in str(exc)
+    else:
+        raise AssertionError("invalid concurrency was accepted")
+
+
+def test_case_artifact_name_collisions_are_rejected():
+    try:
+        validate_case_names([Case("same/id", "q", "a", ""), Case("same_id", "q", "a", "")])
+    except ValueError as exc:
+        assert "artifact name collision" in str(exc)
+    else:
+        raise AssertionError("artifact name collision was accepted")
+
+
 if __name__ == "__main__":
     for test in [
         test_complete_correct_graph,
@@ -1558,7 +1793,7 @@ if __name__ == "__main__":
         test_interrogation_uses_llm_targets,
         test_interrogation_update_mutates_existing_targets,
         test_interrogation_target_selection_sees_updates,
-        test_interrogation_repairs_ungrounded_query_constraint,
+        test_interrogation_repairs_ungrounded_query_target,
         test_interrogation_repairs_unsupported_root_on_answer_path,
         test_changed_edge_can_be_refined,
         test_interrogation_rejects_node_without_provenance,
@@ -1604,8 +1839,15 @@ if __name__ == "__main__":
         test_decisiveness_drops_disconnected_branch,
         test_coverage_requires_an_explicit_answer_node,
         test_coverage_rejects_numeric_answer_prefixes_and_fractions,
+        test_coverage_requires_a_query_target,
+        test_coverage_requires_query_target_on_answer_path,
+        test_missing_query_target_is_deterministically_repaired,
+        test_complete_json_retries_a_malformed_response,
         test_compact_output_counts_only_decisive_items,
         test_compact_output_counts_tool_debt,
+        test_case_processing_is_concurrent_bounded_and_ordered,
+        test_case_processing_rejects_invalid_concurrency,
+        test_case_artifact_name_collisions_are_rejected,
     ]:
         test()
     print("ok")

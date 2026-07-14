@@ -4,7 +4,7 @@ Decide only whether the supplied premises, through the stated edge operation or 
 
 A verified premise may summarize an earlier calculation. Use that verified result directly when it is sufficient; do not demand the premise's original inputs again. For example, a verified sum of two group counts plus a verified union count is sufficient for the inclusion-exclusion step.
 
-A verified premise may have kind `question` or `query_constraint`. Interpret it only as the operative target or constraint that connects the other premises to the requested result, even when it is phrased interrogatively; do not treat it as an asserted answer. For example, "least positive integer value of x" restricts x to positive integers and asks for the minimum qualifying x. This interpretation uses only the supplied premise; you are not given the original question.
+A verified premise may have kind `question`, `query_constraint`, or `query_target`. Interpret a `query_target` only as the value or object requested by the question, not as an asserted answer. Interpret the other question-derived kinds as operative constraints connecting the premises to the requested result, even when phrased interrogatively. For example, "least positive integer value of x" restricts x to positive integers and asks for the minimum qualifying x. This interpretation uses only the supplied premise; you are not given the original question.
 
 Use:
 - valid only when the target follows from every supplied premise under ordinary mathematics or logic

@@ -7,7 +7,9 @@ import os
 import sys
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -25,54 +27,123 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("cases")
     parser.add_argument("--mode", choices=["direct", "one-shot-graph", "interrogation"], default="interrogation")
     parser.add_argument("--max-interrogation-rounds", type=int, default=20)
+    parser.add_argument("--concurrency", type=positive_int, default=10)
     args = parser.parse_args(list(argv) if argv is not None else None)
-    artifact_dir = setup_run_outputs(args.cases, args.mode)
+    cases = [Case.from_dict(row) for row in read_jsonl(args.cases)]
+    validate_case_names(cases)
+    artifact_dir = setup_run_outputs(args.cases, args.mode, args.concurrency)
 
-    case_count = 0
-    for row in read_jsonl(args.cases):
-        case = Case.from_dict(row)
-        case_count += 1
-        logging.info("case start id=%s", case.id)
-        if args.mode == "direct":
-            output = run_stage("direct", run_direct, case)
-        else:
-            graph = run_stage("build_graph", build_graph, case)
-            save_graph(artifact_dir, case.id, "build_graph", graph)
-            if args.mode == "interrogation":
-                graph = run_stage(
-                    "interrogate",
-                    interrogate,
-                    case,
-                    graph,
-                    artifact_dir,
-                    args.max_interrogation_rounds,
-                )
-                save_graph(artifact_dir, case.id, "interrogate", graph)
-            graph = run_stage("mark_decisive", mark_decisive, case, graph)
-            save_graph(artifact_dir, case.id, "mark_decisive", graph)
-            graph = run_stage("verify_graph", verify_graph, case, graph, verify_edge_with_llm)
-            save_graph(artifact_dir, case.id, "verify_graph", graph)
-            result = run_stage("aggregate", final_status, graph)
-            output = compact_output(case, args.mode, graph, result.status)
-        logging.info("case end id=%s status=%s", case.id, output["status"])
+    for output in process_cases(
+        cases,
+        args.mode,
+        artifact_dir,
+        args.max_interrogation_rounds,
+        args.concurrency,
+    ):
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    logging.info("run end cases=%s", case_count)
+    logging.info("run end cases=%s", len(cases))
     return 0
 
 
-def run_stage(name: str, action, *args):
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def validate_case_names(cases: Iterable[Case]) -> None:
+    seen: dict[str, str] = {}
+    for case in cases:
+        name = case_name(case.id)
+        if name in seen:
+            raise ValueError(f"case artifact name collision: {seen[name]!r} and {case.id!r}")
+        seen[name] = case.id
+
+
+def process_cases(
+    cases: Iterable[Case],
+    mode: str,
+    artifact_dir: Path,
+    max_interrogation_rounds: int,
+    concurrency: int,
+) -> Iterable[dict[str, Any]]:
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    action = partial(
+        process_case,
+        mode=mode,
+        artifact_dir=artifact_dir,
+        max_interrogation_rounds=max_interrogation_rounds,
+    )
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="case") as executor:
+        yield from executor.map(action, cases)
+
+
+def process_case(
+    case: Case,
+    *,
+    mode: str,
+    artifact_dir: Path,
+    max_interrogation_rounds: int,
+) -> dict[str, Any]:
+    logging.info("case start id=%s", case.id)
+    if mode == "direct":
+        output = run_stage("direct", run_direct, case, case_id=case.id)
+    else:
+        graph = run_stage("build_graph", build_graph, case, case_id=case.id)
+        save_graph(artifact_dir, case.id, "build_graph", graph)
+        if mode == "interrogation":
+            graph = run_stage(
+                "interrogate",
+                interrogate,
+                case,
+                graph,
+                artifact_dir,
+                max_interrogation_rounds,
+                case_id=case.id,
+            )
+            save_graph(artifact_dir, case.id, "interrogate", graph)
+        graph = run_stage("mark_decisive", mark_decisive, case, graph, case_id=case.id)
+        save_graph(artifact_dir, case.id, "mark_decisive", graph)
+        graph = run_stage(
+            "verify_graph",
+            verify_graph,
+            case,
+            graph,
+            verify_edge_with_llm,
+            case_id=case.id,
+        )
+        save_graph(artifact_dir, case.id, "verify_graph", graph)
+        result = run_stage("aggregate", final_status, graph, case_id=case.id)
+        output = compact_output(case, mode, graph, result.status)
+    logging.info("case end id=%s status=%s", case.id, output["status"])
+    return output
+
+
+def run_stage(name: str, action, *args, case_id: str):
     start = time.perf_counter()
-    logging.info("stage start name=%s", name)
+    logging.info("stage start case=%s name=%s", case_id, name)
     try:
         result = action(*args)
     except Exception:
-        logging.exception("stage error name=%s elapsed=%.2fs", name, time.perf_counter() - start)
+        logging.exception(
+            "stage error case=%s name=%s elapsed=%.2fs",
+            case_id,
+            name,
+            time.perf_counter() - start,
+        )
         raise
-    logging.info("stage end name=%s elapsed=%.2fs", name, time.perf_counter() - start)
+    logging.info(
+        "stage end case=%s name=%s elapsed=%.2fs",
+        case_id,
+        name,
+        time.perf_counter() - start,
+    )
     return result
 
 
-def setup_run_outputs(cases: str, mode: str) -> Path:
+def setup_run_outputs(cases: str, mode: str, concurrency: int) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     artifact_dir = Path("runs") / f"graph-verifier-{stamp}-{os.getpid()}"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -83,10 +154,16 @@ def setup_run_outputs(cases: str, mode: str) -> Path:
     logging.basicConfig(
         filename=log_path,
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
         force=True,
     )
-    logging.info("run start cases=%s mode=%s artifacts=%s", cases, mode, artifact_dir)
+    logging.info(
+        "run start cases=%s mode=%s concurrency=%s artifacts=%s",
+        cases,
+        mode,
+        concurrency,
+        artifact_dir,
+    )
     print(f"log: {log_path}", file=sys.stderr)
     print(f"artifacts: {artifact_dir}", file=sys.stderr)
     return artifact_dir

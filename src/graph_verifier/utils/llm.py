@@ -22,21 +22,53 @@ def complete_json(
     prompt_name: str,
     data: dict[str, Any],
     model_config: str | Path = DEFAULT_MODEL_CONFIG,
+    *,
+    attempts: int = 2,
 ) -> dict[str, Any]:
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
     prompt_path = PROMPT_DIR / prompt_name
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise LLMError(f"missing prompt {prompt_name}: {exc}") from exc
     content = prompt + "\n\nINPUT JSON:\n" + json.dumps(data, ensure_ascii=False)
-    start = time.perf_counter()
-    logging.info("llm start prompt=%s", prompt_name)
-    try:
-        text = complete(content, model_config)
-    except Exception:
-        logging.exception("llm error prompt=%s elapsed=%.2fs", prompt_name, time.perf_counter() - start)
-        raise
-    logging.info("llm end prompt=%s elapsed=%.2fs", prompt_name, time.perf_counter() - start)
+    last_error: LLMError | None = None
+    for attempt in range(1, attempts + 1):
+        start = time.perf_counter()
+        logging.info("llm start prompt=%s attempt=%s", prompt_name, attempt)
+        try:
+            text = complete(content, model_config)
+            result = parse_json_object(text)
+        except LLMError as exc:
+            last_error = exc
+            if attempt == attempts:
+                logging.exception(
+                    "llm error prompt=%s attempt=%s elapsed=%.2fs",
+                    prompt_name,
+                    attempt,
+                    time.perf_counter() - start,
+                )
+                raise
+            logging.warning(
+                "llm retry prompt=%s attempt=%s elapsed=%.2fs error=%s",
+                prompt_name,
+                attempt,
+                time.perf_counter() - start,
+                exc,
+            )
+            continue
+        logging.info(
+            "llm end prompt=%s attempt=%s elapsed=%.2fs",
+            prompt_name,
+            attempt,
+            time.perf_counter() - start,
+        )
+        return result
+    raise last_error or LLMError("LLM completion failed")
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
     try:
         result = json.loads(text)
     except json.JSONDecodeError:

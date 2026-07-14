@@ -4,7 +4,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import NamedTuple
 
-from graph_verifier.core.models import Case, Edge, Graph, Node, Verification, answer_claim_matches
+from graph_verifier.core.models import (
+    QUERY_TARGET,
+    Case,
+    Edge,
+    Graph,
+    Node,
+    Verification,
+    answer_claim_matches,
+)
 from graph_verifier.core.verify import check_closed_calculation, check_grounding
 from graph_verifier.utils.artifacts import append_jsonl, case_name, write_json
 from graph_verifier.utils.llm import LLMError, complete_agent_json, complete_json
@@ -268,7 +276,7 @@ def node_has_provenance(question: str, node: Node, supported: set[str]) -> bool:
 def node_is_independently_supported(question: str, node: Node) -> bool:
     grounded = check_grounding(question, node.claim, node.sources).status == "valid" and (
         not node.claim.rstrip().endswith("?")
-        or node.kind in {"question", "query_constraint"}
+        or node.kind in {"question", "query_constraint", QUERY_TARGET}
     )
     return grounded or check_closed_calculation(node.claim).status == "valid"
 
@@ -596,12 +604,66 @@ def graph_prompt_data(graph: Graph) -> dict[str, object]:
 
 
 def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], list[Edge], bool, dict[str, object]]:
-    answer_path_nodes, _ = answer_ancestry(graph, matching_answer_ids(case, graph))
+    answer_ids = matching_answer_ids(case, graph)
+    answer_path_nodes, _ = answer_ancestry(graph, answer_ids)
+    nodes_by_id = {node.id: node for node in graph.nodes}
+    answer_edges = [edge for edge in graph.edges if edge.target_node_id in answer_ids]
+    query_targets = [node for node in graph.nodes if node.kind == QUERY_TARGET]
+    ungrounded_query_targets = [
+        node
+        for node in query_targets
+        if check_grounding(case.question, node.claim, node.sources).status != "valid"
+    ]
+
+    def target_query_gap(reason: str) -> tuple[list[Node], list[Edge], bool, dict[str, object]]:
+        if len(answer_edges) == 1:
+            edge = answer_edges[0]
+            return (
+                [],
+                [edge],
+                False,
+                {
+                    "nodes": [],
+                    "edges": [edge.id],
+                    "coverage": False,
+                    "reasons": {edge.id: reason},
+                },
+            )
+        return (
+            [],
+            [],
+            True,
+            {
+                "nodes": [],
+                "edges": [],
+                "coverage": True,
+                "reasons": {"coverage": reason},
+            },
+        )
+
+    if answer_ids and not query_targets:
+        return target_query_gap("missing dedicated query target")
+    if ungrounded_query_targets:
+        node = ungrounded_query_targets[0]
+        return (
+            [node],
+            [],
+            False,
+            {
+                "nodes": [node.id],
+                "edges": [],
+                "coverage": False,
+                "reasons": {node.id: "query target is not an exact quote from the question"},
+            },
+        )
+    if answer_ids and not {node.id for node in query_targets}.intersection(answer_path_nodes):
+        return target_query_gap("query target is not connected to the answer")
+
     supported_node_ids = {edge.target_node_id for edge in graph.edges}
     ungrounded_query_ids = [
         node.id
         for node in graph.nodes
-        if node.kind == "query_constraint"
+        if node.kind in {"query_constraint", QUERY_TARGET}
         and check_grounding(case.question, node.claim, node.sources).status != "valid"
     ]
     unsupported_root_ids = [
@@ -648,7 +710,6 @@ def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], li
     coverage = review.get("coverage", False)
     if not isinstance(coverage, bool):
         raise TypeError("coverage must be boolean")
-    nodes_by_id = {node.id: node for node in graph.nodes}
     edges_by_id = {edge.id: edge for edge in graph.edges}
     if coverage and not node_ids and not edge_ids:
         answer_edges = [
@@ -693,7 +754,10 @@ def mark_decisive(case: Case, graph: Graph) -> Graph:
                 "agent_answer": case.agent_answer,
                 "agent_reasoning": case.agent_reasoning,
                 "graph": {
-                    "nodes": [{"id": node.id, "claim": node.claim} for node in graph.nodes],
+                    "nodes": [
+                        {"id": node.id, "claim": node.claim, "kind": node.kind}
+                        for node in graph.nodes
+                    ],
                     "edges": [
                         {
                             "id": edge.id,

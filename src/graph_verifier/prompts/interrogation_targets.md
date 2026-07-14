@@ -10,6 +10,8 @@ Select a missing node only for a question-specific fact or constraint, a concret
 
 Before returning no target, compare the graph with every explicit query constraint in the question, including the requested domain and optimization condition.
 
+Every graph must contain a dedicated node with kind `query_target` for the value or object requested by the question, and that node must occur on the support path into the answer. If it is missing or disconnected, select the existing edge into the answer so interrogation can add or connect it.
+
 Anchor a missing premise to the inference that needs it:
 - If an existing edge cannot entail its target without a missing premise or query constraint, select that edge, even when the missing premise has no node yet.
 - In particular, select the existing edge into the answer when it omits a domain, optimization, comparison, or selection constraint needed to justify that answer.

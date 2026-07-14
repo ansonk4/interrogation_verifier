@@ -7,6 +7,7 @@ from typing import Any
 VALID = "valid"
 DEBT = "debt"
 REFUTED = "refuted"
+QUERY_TARGET = "query_target"
 
 
 @dataclass

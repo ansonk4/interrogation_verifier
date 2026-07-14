@@ -10,6 +10,7 @@ from fractions import Fraction
 from graph_verifier.core.models import (
     DEBT,
     REFUTED,
+    QUERY_TARGET,
     VALID,
     Case,
     Edge,
@@ -266,6 +267,9 @@ def exposed_numbers(check: ClaimCheck) -> set[Fraction]:
 def verify_coverage(case: Case, graph: Graph) -> Verification:
     answer = normalize_text(case.agent_answer)
     node_by_id = {node.id: node for node in graph.nodes}
+    query_target_ids = {node.id for node in graph.nodes if node.kind == QUERY_TARGET}
+    if not query_target_ids:
+        return Verification(DEBT, "missing query target")
     valid_decisive_edges = [
         edge
         for edge in graph.edges
@@ -312,6 +316,8 @@ def verify_coverage(case: Case, graph: Graph) -> Verification:
     missing_edges = [edge.id for edge in decisive_edges if edge.id not in path_edges]
     if missing_edges:
         return Verification(DEBT, "decisive edge not on answer path: " + ",".join(missing_edges))
+    if not query_target_ids.intersection(path_nodes):
+        return Verification(DEBT, "query target not on valid answer path")
     return Verification(VALID, "valid decisive path to answer")
 
 
