@@ -5,10 +5,13 @@ from unittest.mock import patch
 
 from graph_verifier.core.aggregate import final_status
 from graph_verifier.core.graph import (
+    InterrogationState,
     apply_interrogation_update,
     canonicalize_answer_node,
     interrogate,
     mark_decisive,
+    select_verification_target,
+    target_signature,
 )
 from graph_verifier.core.models import QUERY_TARGET, Case, Edge, Graph, Node, Verification
 from graph_verifier.core.verify import (
@@ -20,7 +23,12 @@ from graph_verifier.core.verify import (
     verify_edge_with_llm,
     verify_graph,
 )
-from graph_verifier.main import compact_output, process_cases, validate_case_names
+from graph_verifier.main import (
+    compact_output,
+    process_cases,
+    run_interrogation_verification,
+    validate_case_names,
+)
 from graph_verifier.utils.llm import LLMError, complete_json
 
 
@@ -1147,6 +1155,22 @@ def test_malformed_edge_verifier_response_becomes_debt():
     assert check.status == "debt"
 
 
+def test_edge_verifier_failure_is_tool_debt():
+    case = Case("case", QUESTION, "A", "")
+    graph = complete_graph()
+    for item in [*graph.nodes, *graph.edges]:
+        item.decisive = True
+
+    def failed_checker(*args):
+        raise LLMError("endpoint down")
+
+    verify_graph(case, graph, failed_checker)
+    assert graph.tool_debt == [
+        "edge verification failed for e2: edge verifier failed: endpoint down"
+    ]
+    assert final_status(graph).status == "verification_debt"
+
+
 def test_non_decisive_edge_cannot_promote_a_decisive_node():
     graph = Graph(
         nodes=[
@@ -1690,6 +1714,314 @@ def test_missing_query_target_is_deterministically_repaired():
     assert graph.coverage_verification.status == "valid"
 
 
+def verification_feedback_graph() -> Graph:
+    return Graph(
+        nodes=[
+            Node(
+                "given",
+                "given fact",
+                decisive=True,
+                verification=Verification("valid", "grounded"),
+            ),
+            Node(
+                "derived",
+                "derived claim",
+                decisive=True,
+                verification=Verification("debt", "not grounded"),
+            ),
+            Node(
+                "answer",
+                "answer A",
+                "answer",
+                decisive=True,
+                verification=Verification("debt", "answer requires verified support"),
+            ),
+        ],
+        edges=[
+            Edge(
+                "cause",
+                ["given"],
+                "derived",
+                "unsupported rule",
+                decisive=True,
+                verification=Verification("debt", "edge claim does not establish target"),
+            ),
+            Edge(
+                "finish",
+                ["derived"],
+                "answer",
+                "derived claim gives answer A",
+                decisive=True,
+                verification=Verification("debt", "unverified premise: derived"),
+            ),
+        ],
+        coverage_verification=Verification("debt", "no valid decisive path to answer"),
+    )
+
+
+def test_verification_feedback_selects_causal_edge():
+    target = select_verification_target(verification_feedback_graph())
+    assert target is not None
+    assert target["target_type"] == "edge"
+    assert target["target_id"] == "cause"
+    assert target["target_reason"] == "edge claim does not establish target"
+
+
+def test_verification_feedback_follows_debt_to_root_node():
+    graph = Graph(
+        nodes=[
+            Node(
+                "root",
+                "unsupported root",
+                decisive=True,
+                verification=Verification("debt", "not grounded"),
+            ),
+            Node(
+                "derived",
+                "derived claim",
+                decisive=True,
+                verification=Verification("debt", "not grounded"),
+            ),
+            Node(
+                "answer",
+                "answer A",
+                "answer",
+                decisive=True,
+                verification=Verification("debt", "answer requires verified support"),
+            ),
+        ],
+        edges=[
+            Edge(
+                "first",
+                ["root"],
+                "derived",
+                "derive",
+                decisive=True,
+                verification=Verification("debt", "unverified premise: root"),
+            ),
+            Edge(
+                "finish",
+                ["derived"],
+                "answer",
+                "finish",
+                decisive=True,
+                verification=Verification("debt", "unverified premise: derived"),
+            ),
+        ],
+        coverage_verification=Verification("debt", "no valid decisive path to answer"),
+    )
+
+    target = select_verification_target(graph)
+    assert target is not None
+    assert target["target_type"] == "node"
+    assert target["target_id"] == "root"
+    assert target["target_reason"] == "not grounded"
+
+
+def test_verification_feedback_uses_coverage_only_as_fallback():
+    graph = Graph(
+        nodes=[
+            Node(
+                "query",
+                "requested value",
+                QUERY_TARGET,
+                decisive=True,
+                verification=Verification("valid", "grounded"),
+            ),
+            Node(
+                "answer",
+                "answer A",
+                "answer",
+                decisive=True,
+                verification=Verification("debt", "answer requires verified support"),
+            ),
+        ],
+        coverage_verification=Verification("debt", "no valid decisive path to answer"),
+    )
+
+    target = select_verification_target(graph)
+    assert target is not None
+    assert target["target_type"] == "coverage"
+    assert target["target_reason"] == "no valid decisive path to answer"
+
+
+def test_verification_feedback_respects_handled_signatures_and_terminal_failures():
+    graph = verification_feedback_graph()
+    handled = {("edge", "cause", target_signature(graph, "edge", "cause"))}
+    assert select_verification_target(graph, handled) is None
+
+    graph.edges[0].claim = "changed unsupported rule"
+    assert select_verification_target(graph, handled)["target_id"] == "cause"
+
+    graph.edges[0].verification = Verification("refuted", "rule is false")
+    assert select_verification_target(graph, handled) is None
+    graph.edges[0].verification = Verification("debt", "edge verifier failed: endpoint down")
+    assert select_verification_target(graph, handled) is None
+
+
+def test_forced_feedback_target_passes_exact_verifier_reason():
+    case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
+    graph = verification_feedback_graph()
+    target = select_verification_target(graph)
+    assert target is not None
+    before = target_signature(graph, "edge", "cause")
+    state = InterrogationState()
+    payloads = []
+
+    def fake_agent(prompt_name, data, model_config):
+        assert prompt_name == "interrogate.md"
+        assert model_config == AGENT_MODEL_CONFIG
+        payloads.append(data)
+        return {
+            "new_nodes": [],
+            "new_edges": [],
+            "updates": [
+                {
+                    "id": "cause",
+                    "premise_node_ids": ["given"],
+                    "target_node_id": "derived",
+                    "claim": "given fact entails the derived claim",
+                }
+            ],
+            "debt": [],
+        }
+
+    with (
+        patch(
+            "graph_verifier.core.graph.complete_json",
+            side_effect=AssertionError("forced target called the ordinary selector"),
+        ),
+        patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
+    ):
+        interrogate(case, graph, max_rounds=1, state=state, forced_target=target)
+
+    assert len(payloads) == 1
+    assert payloads[0]["target_id"] == "cause"
+    assert payloads[0]["target_reason"] == "edge claim does not establish target"
+    assert payloads[0]["target_edge"]["claim"] == "unsupported rule"
+    assert state.rounds_used == 1
+    assert ("edge", "cause", before) in state.handled
+    assert graph.edges[0].claim == "given fact entails the derived claim"
+
+
+def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
+    case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
+    graph = verification_feedback_graph()
+    calls = {"interrogate": 0, "decisive": 0, "verify": 0}
+
+    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+        assert case_arg is case
+        assert graph_arg is graph
+        calls["interrogate"] += 1
+        if forced_target is not None:
+            assert forced_target["target_id"] == "cause"
+            graph_arg.edges[0].claim = "repaired rule"
+            state.rounds_used += 1
+        return graph_arg
+
+    def fake_decisive(case_arg, graph_arg):
+        assert case_arg is case
+        assert graph_arg is graph
+        calls["decisive"] += 1
+        for item in [*graph_arg.nodes, *graph_arg.edges]:
+            item.decisive = True
+        return graph_arg
+
+    def fake_verify(case_arg, graph_arg, edge_checker):
+        assert case_arg is case
+        assert graph_arg is graph
+        calls["verify"] += 1
+        if graph_arg.edges[0].claim == "repaired rule":
+            for item in [*graph_arg.nodes, *graph_arg.edges]:
+                item.verification = Verification("valid", "verified")
+            graph_arg.coverage_verification = Verification("valid", "complete")
+        return graph_arg
+
+    with (
+        patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
+        patch("graph_verifier.main.mark_decisive", side_effect=fake_decisive),
+        patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
+        patch("graph_verifier.main.save_graph"),
+    ):
+        result = run_interrogation_verification(
+            case,
+            graph,
+            Path("artifacts"),
+            3,
+            lambda *args: ClaimCheck("valid", "verified"),
+        )
+
+    assert result is graph
+    assert calls == {"interrogate": 2, "decisive": 2, "verify": 2}
+    assert final_status(graph).status == "verified_reliable"
+
+
+def test_feedback_pipeline_enforces_one_global_repair_budget():
+    case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
+    graph = verification_feedback_graph()
+    calls = {"interrogate": 0, "verify": 0}
+
+    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+        calls["interrogate"] += 1
+        if forced_target is not None:
+            graph_arg.edges[0].claim += " changed"
+            state.rounds_used += 1
+        return graph_arg
+
+    def fake_verify(case_arg, graph_arg, edge_checker):
+        calls["verify"] += 1
+        return graph_arg
+
+    with (
+        patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
+        patch("graph_verifier.main.mark_decisive", side_effect=lambda case_arg, graph_arg: graph_arg),
+        patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
+        patch("graph_verifier.main.save_graph"),
+        patch("graph_verifier.main.save_interrogation_event"),
+    ):
+        run_interrogation_verification(case, graph, Path("artifacts"), 1)
+
+    assert calls == {"interrogate": 2, "verify": 2}
+    assert graph.tool_debt == ["verification feedback reached max rounds: 1"]
+
+
+def test_feedback_pipeline_stops_without_reverification_on_no_progress():
+    case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
+    graph = verification_feedback_graph()
+    calls = {"interrogate": 0, "decisive": 0, "verify": 0}
+
+    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+        calls["interrogate"] += 1
+        if forced_target is not None:
+            state.rounds_used += 1
+            state.handled.add(
+                ("edge", "cause", target_signature(graph_arg, "edge", "cause"))
+            )
+            graph_arg.edges[0].verification = Verification(
+                "debt", "interrogation could not ground"
+            )
+        return graph_arg
+
+    def fake_decisive(case_arg, graph_arg):
+        calls["decisive"] += 1
+        return graph_arg
+
+    def fake_verify(case_arg, graph_arg, edge_checker):
+        calls["verify"] += 1
+        return graph_arg
+
+    with (
+        patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
+        patch("graph_verifier.main.mark_decisive", side_effect=fake_decisive),
+        patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
+        patch("graph_verifier.main.save_graph"),
+    ):
+        run_interrogation_verification(case, graph, Path("artifacts"), 3)
+
+    assert calls == {"interrogate": 2, "decisive": 1, "verify": 1}
+    assert graph.edges[0].verification.reason == "interrogation could not ground"
+
+
 def test_complete_json_retries_a_malformed_response():
     calls = 0
 
@@ -1816,6 +2148,7 @@ if __name__ == "__main__":
         test_false_edge_claim_cannot_ride_on_a_true_target,
         test_duplicate_ids_fail_closed,
         test_malformed_edge_verifier_response_becomes_debt,
+        test_edge_verifier_failure_is_tool_debt,
         test_non_decisive_edge_cannot_promote_a_decisive_node,
         test_answer_endpoint_is_canonicalized_from_agent_answer,
         test_latex_wrappers_do_not_break_exact_grounding,
@@ -1842,6 +2175,14 @@ if __name__ == "__main__":
         test_coverage_requires_a_query_target,
         test_coverage_requires_query_target_on_answer_path,
         test_missing_query_target_is_deterministically_repaired,
+        test_verification_feedback_selects_causal_edge,
+        test_verification_feedback_follows_debt_to_root_node,
+        test_verification_feedback_uses_coverage_only_as_fallback,
+        test_verification_feedback_respects_handled_signatures_and_terminal_failures,
+        test_forced_feedback_target_passes_exact_verifier_reason,
+        test_feedback_pipeline_reuses_graph_and_reverifies_after_repair,
+        test_feedback_pipeline_enforces_one_global_repair_budget,
+        test_feedback_pipeline_stops_without_reverification_on_no_progress,
         test_complete_json_retries_a_malformed_response,
         test_compact_output_counts_only_decisive_items,
         test_compact_output_counts_tool_debt,

@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from graph_verifier.core.aggregate import final_status
-from graph_verifier.core.graph import build_graph, interrogate, mark_decisive
+from graph_verifier.core.graph import (
+    InterrogationState,
+    build_graph,
+    interrogate,
+    mark_decisive,
+    save_interrogation_event,
+    select_verification_target,
+    target_signature,
+)
 from graph_verifier.core.models import Case, Graph
 from graph_verifier.core.verify import verify_edge_with_llm, verify_graph
 from graph_verifier.utils.artifacts import case_name, write_json
@@ -94,31 +102,115 @@ def process_case(
         graph = run_stage("build_graph", build_graph, case, case_id=case.id)
         save_graph(artifact_dir, case.id, "build_graph", graph)
         if mode == "interrogation":
-            graph = run_stage(
-                "interrogate",
-                interrogate,
+            graph = run_interrogation_verification(
                 case,
                 graph,
                 artifact_dir,
                 max_interrogation_rounds,
+                verify_edge_with_llm,
+            )
+        else:
+            graph = run_stage("mark_decisive", mark_decisive, case, graph, case_id=case.id)
+            save_graph(artifact_dir, case.id, "mark_decisive", graph)
+            graph = run_stage(
+                "verify_graph",
+                verify_graph,
+                case,
+                graph,
+                verify_edge_with_llm,
                 case_id=case.id,
             )
-            save_graph(artifact_dir, case.id, "interrogate", graph)
-        graph = run_stage("mark_decisive", mark_decisive, case, graph, case_id=case.id)
-        save_graph(artifact_dir, case.id, "mark_decisive", graph)
-        graph = run_stage(
-            "verify_graph",
-            verify_graph,
-            case,
-            graph,
-            verify_edge_with_llm,
-            case_id=case.id,
-        )
-        save_graph(artifact_dir, case.id, "verify_graph", graph)
+            save_graph(artifact_dir, case.id, "verify_graph", graph)
         result = run_stage("aggregate", final_status, graph, case_id=case.id)
         output = compact_output(case, mode, graph, result.status)
     logging.info("case end id=%s status=%s", case.id, output["status"])
     return output
+
+
+def run_interrogation_verification(
+    case: Case,
+    graph: Graph,
+    artifact_dir: Path,
+    max_interrogation_rounds: int,
+    edge_checker=verify_edge_with_llm,
+) -> Graph:
+    state = InterrogationState()
+    graph = run_stage(
+        "interrogate",
+        interrogate,
+        case,
+        graph,
+        artifact_dir,
+        max_interrogation_rounds,
+        state,
+        None,
+        case_id=case.id,
+    )
+    save_graph(artifact_dir, case.id, "interrogate", graph)
+
+    feedback_cycle = 0
+    while True:
+        stage_suffix = "" if feedback_cycle == 0 else f"_feedback_{feedback_cycle}"
+        graph = run_stage(
+            "mark_decisive" + stage_suffix,
+            mark_decisive,
+            case,
+            graph,
+            case_id=case.id,
+        )
+        save_graph(artifact_dir, case.id, "mark_decisive", graph)
+        graph = run_stage(
+            "verify_graph" + stage_suffix,
+            verify_graph,
+            case,
+            graph,
+            edge_checker,
+            case_id=case.id,
+        )
+        save_graph(artifact_dir, case.id, "verify_graph", graph)
+
+        result = final_status(graph)
+        if result.status in {"verified_reliable", "answer_refuted"} or graph.tool_debt:
+            break
+        target = select_verification_target(graph, state.handled)
+        if target is None:
+            break
+        if state.rounds_used >= max_interrogation_rounds:
+            reason = f"verification feedback reached max rounds: {max_interrogation_rounds}"
+            graph.tool_debt.append(reason)
+            save_interrogation_event(
+                artifact_dir,
+                case.id,
+                {
+                    "round": state.selection_checks + 1,
+                    "event": "verification_feedback_max_rounds",
+                    "max_rounds": max_interrogation_rounds,
+                    "selected": target,
+                },
+            )
+            save_graph(artifact_dir, case.id, "verify_graph", graph)
+            break
+
+        target_type = str(target["target_type"])
+        target_id = str(target["target_id"])
+        before = target_signature(graph, target_type, target_id)
+        feedback_cycle += 1
+        graph = run_stage(
+            f"interrogate_feedback_{feedback_cycle}",
+            interrogate,
+            case,
+            graph,
+            artifact_dir,
+            max_interrogation_rounds,
+            state,
+            target,
+            case_id=case.id,
+        )
+        save_graph(artifact_dir, case.id, "interrogate", graph)
+        after = target_signature(graph, target_type, target_id)
+        if graph.tool_debt or after == before:
+            break
+    return graph
 
 
 def run_stage(name: str, action, *args, case_id: str):

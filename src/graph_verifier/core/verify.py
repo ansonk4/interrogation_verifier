@@ -120,6 +120,15 @@ def verify_graph(
         if not changed:
             break
 
+    for edge in graph.edges:
+        if (
+            edge.decisive
+            and edge.verification.status == DEBT
+            and is_edge_verifier_failure(edge.verification.reason)
+        ):
+            reason = f"edge verification failed for {edge.id}: {edge.verification.reason}"
+            if reason not in graph.tool_debt:
+                graph.tool_debt.append(reason)
     graph.coverage_verification = verify_coverage(case, graph)
     return graph
 
@@ -129,6 +138,10 @@ def set_verification(item: Node | Edge, verification: Verification) -> bool:
         return False
     item.verification = verification
     return True
+
+
+def is_edge_verifier_failure(reason: str) -> bool:
+    return reason.startswith("edge verifier ")
 
 
 def validate_edge_structure(edge: Edge, node_by_id: dict[str, Node]) -> Verification | None:

@@ -13,6 +13,8 @@ Focus on exactly one target from the input:
 - target_type=edge means interrogate target_edge only.
 - target_type=coverage means add only the missing graph items needed to make the support path explicit, or mark debt when they cannot be grounded.
 
+target_reason is the exact unresolved defect found by the reviewer or verifier. Repair that defect directly. When it says the supplied premises do not establish a role, relationship, constraint, or target, reuse an existing graph premise that states it or add the smallest grounded premise needed to make it explicit.
+
 If rejection_reason is non-empty, your previous repair was rejected. Correct that exact defect and return the complete repair again; do not assume any part of the rejected repair was added to the graph. If rejection_reason says a new node has no provenance, return that node again and add a new edge whose target_node_id is exactly that node's ID, using existing supporting nodes as premises. Also return the update to the originally selected target. Merely changing the wording of the selected target is not a correction.
 
 For a node target with kind=query_constraint or kind=query_target that is not an exact phrase from the question, update that existing node's claim to the shortest operative phrase copied verbatim from the question, preserving its original math notation. A direct question quote needs no incoming edge; do not add a replacement node.

@@ -11,6 +11,7 @@ question + agent answer + reasoning
   -> decisive subgraph
   -> node and edge verification
   -> coverage check
+  -> verifier-targeted interrogation when repairable debt remains
   -> final status
 ```
 
@@ -62,7 +63,7 @@ If the LLM explicitly returns the target as debt, extra edits are discarded and 
 
 #### When interrogation ends
 
-Interrogation stops when:
+The proactive interrogation pass stops when:
 
 - the input graph already has tool debt;
 - target selection finds no unhandled target;
@@ -89,6 +90,8 @@ Without `agent_model_config`, no repair call is made. Each selected target is ma
 
 Graph extraction, decisiveness review, and edge verification are separate stages and are not included in these counts.
 
+The same `max-interrogation-rounds` budget is shared with verifier-targeted feedback. An empty target-selection check does not consume a repair round; each selected proactive or verifier target does.
+
 ### 3. Mark decisive items
 
 An independent review selects the minimal reasoning path needed for the final answer. Disconnected, duplicate, alternative, and merely explanatory items are removed from the decisive subgraph.
@@ -109,7 +112,19 @@ The edge verifier does not receive the original question, agent reasoning, expec
 
 Coverage is valid only when there is a complete path of decisive, valid nodes and edges ending at an explicit answer node that exactly matches the agent's answer.
 
-### 6. Produce the final status
+### 6. Feed repairable verification debt back
+
+After verification, the system stops immediately for a reliable graph, a decisive refutation, or tool failure. Otherwise it walks backward from the answer and selects one causal debt item:
+
+- a debt edge whose premises are valid;
+- an unsupported root node when downstream edges fail only because of that node;
+- coverage only when no more specific node or edge failure exists.
+
+Answer-node debt, downstream `unverified premise` edges, and generic coverage debt are treated as symptoms while an upstream cause exists. The exact verifier reason and graph item are forced into the original-agent interrogation call, bypassing ordinary target selection for that repair. A structural repair is followed by a fresh decisiveness review and complete verification on the same graph. Graph extraction is never repeated.
+
+Feedback stops on reliability, refutation, tool failure, explicit agent debt, an unchanged target signature, a previously handled signature, or the shared round limit.
+
+### 7. Produce the final status
 
 | Status | Meaning |
 |---|---|

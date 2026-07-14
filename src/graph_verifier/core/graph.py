@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
 from graph_verifier.core.models import (
+    DEBT,
     QUERY_TARGET,
+    REFUTED,
+    VALID,
     Case,
     Edge,
     Graph,
@@ -13,7 +17,11 @@ from graph_verifier.core.models import (
     Verification,
     answer_claim_matches,
 )
-from graph_verifier.core.verify import check_closed_calculation, check_grounding
+from graph_verifier.core.verify import (
+    check_closed_calculation,
+    check_grounding,
+    is_edge_verifier_failure,
+)
 from graph_verifier.utils.artifacts import append_jsonl, case_name, write_json
 from graph_verifier.utils.llm import LLMError, complete_agent_json, complete_json
 
@@ -24,6 +32,16 @@ class InterrogationUpdateResult(NamedTuple):
 
     def __bool__(self) -> bool:
         return self.accepted
+
+
+TargetKey = tuple[str, str, object]
+
+
+@dataclass
+class InterrogationState:
+    handled: set[TargetKey] = field(default_factory=set)
+    rounds_used: int = 0
+    selection_checks: int = 0
 
 
 def build_graph(case: Case) -> Graph:
@@ -56,52 +74,91 @@ def build_graph(case: Case) -> Graph:
         return Graph.failed(f"graph extraction failed: {exc}")
 
 
-def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_rounds: int = 20) -> Graph:
+def interrogate(
+    case: Case,
+    graph: Graph,
+    artifact_dir: Path | None = None,
+    max_rounds: int = 20,
+    state: InterrogationState | None = None,
+    forced_target: dict[str, object] | None = None,
+) -> Graph:
     if graph.tool_debt:
         return graph
-    handled: set[tuple[str, str, object]] = set()
-    for round_number in range(1, max_rounds + 1):
-        try:
-            target_nodes, target_edges, target_coverage, review = find_interrogation_targets(case, graph)
-        except (LLMError, KeyError, TypeError, ValueError) as exc:
-            graph.tool_debt.append(f"interrogation target selection failed: {exc}")
+    state = state or InterrogationState()
+    forced = forced_target is not None
+    while state.rounds_used < max_rounds:
+        state.selection_checks += 1
+        round_number = state.selection_checks
+        if forced_target is not None:
+            target = forced_target
+            forced_target = None
             save_interrogation_event(
                 artifact_dir,
                 case.id,
                 {
                     "round": round_number,
-                    "event": "target_selection_error",
-                    "prompt": "interrogation_targets.md",
-                    "error": str(exc),
+                    "event": "verification_feedback_target",
+                    "selected": target,
                 },
             )
-            break
-        target = select_interrogation_target(graph, target_nodes, target_edges, target_coverage, handled)
-        if target is not None:
-            reasons = review.get("reasons", {})
-            if isinstance(reasons, dict):
-                target["target_reason"] = str(
-                    reasons.get(target["target_id"], reasons.get("coverage", ""))
+        else:
+            try:
+                target_nodes, target_edges, target_coverage, review = find_interrogation_targets(
+                    case, graph
                 )
-        save_interrogation_event(
-            artifact_dir,
-            case.id,
-            {
-                "round": round_number,
-                "event": "target_selection",
-                "prompt": "interrogation_targets.md",
-                "selected": target,
-                "response": review,
-            },
-        )
+            except (LLMError, KeyError, TypeError, ValueError) as exc:
+                graph.tool_debt.append(f"interrogation target selection failed: {exc}")
+                save_interrogation_event(
+                    artifact_dir,
+                    case.id,
+                    {
+                        "round": round_number,
+                        "event": "target_selection_error",
+                        "prompt": "interrogation_targets.md",
+                        "error": str(exc),
+                    },
+                )
+                break
+            target = select_interrogation_target(
+                graph, target_nodes, target_edges, target_coverage, state.handled
+            )
+            if target is not None:
+                reasons = review.get("reasons", {})
+                if isinstance(reasons, dict):
+                    target["target_reason"] = str(
+                        reasons.get(target["target_id"], reasons.get("coverage", ""))
+                    )
+            save_interrogation_event(
+                artifact_dir,
+                case.id,
+                {
+                    "round": round_number,
+                    "event": "target_selection",
+                    "prompt": "interrogation_targets.md",
+                    "selected": target,
+                    "response": review,
+                },
+            )
         if target is None:
             break
         target_type = str(target["target_type"])
         target_id = str(target["target_id"])
         target_key = (target_type, target_id, target_signature(graph, target_type, target_id))
+        if target_key in state.handled:
+            save_interrogation_event(
+                artifact_dir,
+                case.id,
+                {
+                    "round": round_number,
+                    "event": "verification_feedback_already_handled",
+                    "selected": target,
+                },
+            )
+            break
+        state.rounds_used += 1
         if not case.agent_model_config:
             mark_interrogation_debt(graph, target_type, target_id, "original agent unavailable")
-            handled.add(target_key)
+            state.handled.add(target_key)
             save_interrogation_event(
                 artifact_dir,
                 case.id,
@@ -113,6 +170,8 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
                 },
             )
             save_interrogation_graph(artifact_dir, case.id, graph)
+            if forced:
+                break
             continue
         rejection_reason = ""
         interrogation_error = False
@@ -170,7 +229,7 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
                 },
             )
             if accepted:
-                handled.add(target_key)
+                state.handled.add(target_key)
                 break
         else:
             mark_interrogation_debt(
@@ -179,15 +238,18 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
                 target_id,
                 f"interrogation rejected twice: {rejection_reason}",
             )
-            handled.add(target_key)
+            state.handled.add(target_key)
         save_interrogation_graph(artifact_dir, case.id, graph)
-        if interrogation_error:
+        if interrogation_error or forced:
             break
     else:
         final_review: dict[str, object] | None = None
+        state.selection_checks += 1
         try:
             nodes, edges, coverage, final_review = find_interrogation_targets(case, graph)
-            remaining = select_interrogation_target(graph, nodes, edges, coverage, handled)
+            remaining = select_interrogation_target(
+                graph, nodes, edges, coverage, state.handled
+            )
         except (LLMError, KeyError, TypeError, ValueError) as exc:
             remaining = {"error": str(exc)}
         if remaining is not None:
@@ -196,7 +258,7 @@ def interrogate(case: Case, graph: Graph, artifact_dir: Path | None = None, max_
             artifact_dir,
             case.id,
             {
-                "round": max_rounds,
+                "round": state.selection_checks,
                 "event": "max_rounds",
                 "max_rounds": max_rounds,
                 "remaining": remaining,
@@ -535,7 +597,7 @@ def select_interrogation_target(
     nodes: list[Node],
     edges: list[Edge],
     coverage: bool,
-    handled: set[tuple[str, str, object]],
+    handled: set[TargetKey],
 ) -> dict[str, object] | None:
     candidates: list[dict[str, object]] = []
     for node in nodes:
@@ -580,6 +642,144 @@ def select_interrogation_target(
         if (target_type, target_id, state) not in handled:
             return candidate
     return None
+
+
+def select_verification_target(
+    graph: Graph,
+    handled: set[TargetKey] | None = None,
+) -> dict[str, object] | None:
+    handled = handled or set()
+    decisive_items = [
+        item for item in [*graph.nodes, *graph.edges] if item.decisive
+    ]
+    if graph.tool_debt or any(
+        item.verification.status == REFUTED for item in decisive_items
+    ):
+        return None
+    if graph.coverage_decisive and graph.coverage_verification.status == REFUTED:
+        return None
+    if any(
+        item.verification.status == DEBT
+        and is_edge_verifier_failure(item.verification.reason)
+        for item in decisive_items
+    ):
+        return None
+
+    nodes_by_id = {node.id: node for node in graph.nodes}
+    incoming: dict[str, list[Edge]] = {}
+    for edge in graph.edges:
+        if edge.decisive:
+            incoming.setdefault(edge.target_node_id, []).append(edge)
+
+    def causal_target(node_id: str, visiting: set[str]) -> tuple[str, str] | None:
+        if node_id in visiting:
+            return None
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            return None
+        visiting = {*visiting, node_id}
+        for edge in incoming.get(node_id, []):
+            if edge.verification.status != DEBT:
+                continue
+            blocked_by_premise = False
+            for premise_id in edge.premise_node_ids:
+                premise = nodes_by_id.get(premise_id)
+                if premise is None:
+                    return "edge", edge.id
+                if premise.verification.status == VALID:
+                    continue
+                blocked_by_premise = True
+                upstream = causal_target(premise_id, visiting)
+                if upstream is not None:
+                    return upstream
+            if not blocked_by_premise:
+                return "edge", edge.id
+        if (
+            node.decisive
+            and node.kind != "answer"
+            and node.verification.status == DEBT
+        ):
+            return "node", node.id
+        return None
+
+    candidate: tuple[str, str] | None = None
+    for answer in graph.nodes:
+        if answer.decisive and answer.kind == "answer":
+            candidate = causal_target(answer.id, set())
+            if candidate is not None:
+                break
+
+    if candidate is None:
+        for edge in graph.edges:
+            if not edge.decisive or edge.verification.status != DEBT:
+                continue
+            missing_reference = (
+                not edge.premise_node_ids
+                or any(node_id not in nodes_by_id for node_id in edge.premise_node_ids)
+                or edge.target_node_id not in nodes_by_id
+            )
+            premises_valid = all(
+                nodes_by_id[node_id].verification.status == VALID
+                for node_id in edge.premise_node_ids
+                if node_id in nodes_by_id
+            )
+            if missing_reference or premises_valid:
+                candidate = "edge", edge.id
+                break
+
+    if candidate is None:
+        for node in graph.nodes:
+            if (
+                node.decisive
+                and node.kind != "answer"
+                and node.verification.status == DEBT
+                and not incoming.get(node.id)
+            ):
+                candidate = "node", node.id
+                break
+
+    if candidate is None and graph.coverage_decisive:
+        if graph.coverage_verification.status == DEBT:
+            candidate = "coverage", "coverage"
+    if candidate is None:
+        return None
+
+    target_type, target_id = candidate
+    target_key = (
+        target_type,
+        target_id,
+        target_signature(graph, target_type, target_id),
+    )
+    if target_key in handled:
+        return None
+    if target_type == "node":
+        node = nodes_by_id[target_id]
+        return {
+            "target_type": "node",
+            "target_id": target_id,
+            "target_node": node_prompt_data(node),
+            "target_edge": None,
+            "target_coverage": False,
+            "target_reason": node.verification.reason,
+        }
+    if target_type == "edge":
+        edge = next(edge for edge in graph.edges if edge.id == target_id)
+        return {
+            "target_type": "edge",
+            "target_id": target_id,
+            "target_node": None,
+            "target_edge": edge_prompt_data(edge),
+            "target_coverage": False,
+            "target_reason": edge.verification.reason,
+        }
+    return {
+        "target_type": "coverage",
+        "target_id": "coverage",
+        "target_node": None,
+        "target_edge": None,
+        "target_coverage": True,
+        "target_reason": graph.coverage_verification.reason,
+    }
 
 
 def node_prompt_data(node: Node) -> dict[str, object]:
