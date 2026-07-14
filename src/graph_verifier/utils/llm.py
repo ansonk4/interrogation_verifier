@@ -16,6 +16,8 @@ class LLMError(RuntimeError):
 ROOT = Path(__file__).resolve().parents[3]
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
 DEFAULT_MODEL_CONFIG = ROOT / "model" / "openrouter" / "deepseek" / "deepseek-v4-flash-high.json"
+DEFAULT_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.0
 
 
 def complete_json(
@@ -23,7 +25,7 @@ def complete_json(
     data: dict[str, Any],
     model_config: str | Path = DEFAULT_MODEL_CONFIG,
     *,
-    attempts: int = 2,
+    attempts: int = DEFAULT_ATTEMPTS,
 ) -> dict[str, Any]:
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
@@ -51,12 +53,14 @@ def complete_json(
                 )
                 raise
             logging.warning(
-                "llm retry prompt=%s attempt=%s elapsed=%.2fs error=%s",
+                "llm retry prompt=%s attempt=%s elapsed=%.2fs backoff=%.1fs error=%s",
                 prompt_name,
                 attempt,
                 time.perf_counter() - start,
+                RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1),
                 exc,
             )
+            time.sleep(RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
             continue
         logging.info(
             "llm end prompt=%s attempt=%s elapsed=%.2fs",
@@ -69,6 +73,8 @@ def complete_json(
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    if not isinstance(text, str):
+        raise LLMError("LLM response content must be a string")
     try:
         result = json.loads(text)
     except json.JSONDecodeError:
@@ -136,6 +142,9 @@ def complete(content: str, model_config: str | Path = DEFAULT_MODEL_CONFIG) -> s
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise LLMError(str(exc)) from exc
     try:
-        return payload["choices"][0]["message"]["content"]
+        content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError("malformed LLM response") from exc
+    if not isinstance(content, str):
+        raise LLMError("LLM response content must be a string")
+    return content

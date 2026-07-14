@@ -184,9 +184,9 @@ def run_direct(case: Case) -> dict[str, Any]:
                 "agent_reasoning": case.agent_reasoning,
             },
         )
-        status = str(data.get("status", "verification_debt"))
+        status = str(data.get("status", "tool_error"))
     except LLMError as exc:
-        status = "verification_debt"
+        status = "tool_error"
         data = {"reason": str(exc)}
     return {
         "id": case.id,
@@ -211,8 +211,6 @@ def compact_output(case: Case, mode: str, graph: Graph, status: str) -> dict[str
             refuted += 1
         else:
             debt += 1
-    if graph.tool_debt:
-        debt += 1
     return {
         "id": case.id,
         "mode": mode,
@@ -225,6 +223,7 @@ def compact_output(case: Case, mode: str, graph: Graph, status: str) -> dict[str
         "valid": valid,
         "debt": debt,
         "refuted": refuted,
+        "tool_errors": len(graph.tool_debt),
     }
 
 
