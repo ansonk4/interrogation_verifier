@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any
 
 
@@ -194,12 +196,102 @@ def graph_id_error(graph: Graph) -> str | None:
     return None
 
 
+_ANSWER_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+_ANSWER_PREFIXES = ("the answer is ", "answer is ", "answer ")
+
+
 def answer_claim_matches(claim: str, answer: str) -> bool:
-    claim = " ".join(claim.lower().split()).rstrip(".!?")
-    answer = " ".join(answer.lower().split()).rstrip(".!?")
-    return bool(answer) and claim in {
-        answer,
-        f"answer {answer}",
-        f"answer is {answer}",
-        f"the answer is {answer}",
-    }
+    payload = answer_claim_payload(claim)
+    return bool(normalize_answer_text(answer)) and (
+        answer_values_equal(claim, answer) or answer_values_equal(payload, answer)
+    )
+
+
+def answer_claim_payload(claim: str) -> str:
+    text = _strip_terminal_punctuation(" ".join(claim.split()))
+    lowered = text.casefold()
+    for prefix in _ANSWER_PREFIXES:
+        if lowered.startswith(prefix):
+            return text[len(prefix) :].strip()
+    return text
+
+
+def answer_claim_value(claim: str) -> object | None:
+    return parse_answer_value(answer_claim_payload(claim))
+
+
+def answer_values_equal(left: str, right: str) -> bool:
+    left_value = parse_answer_value(left)
+    right_value = parse_answer_value(right)
+    if left_value is not None and right_value is not None:
+        return left_value == right_value
+    return normalize_answer_text(left) == normalize_answer_text(right)
+
+
+def parse_answer_value(text: str) -> object | None:
+    text = _normalize_answer_surface(text)
+    if not text:
+        return None
+
+    if text.startswith("(") and text.endswith(")"):
+        parts = _split_top_level(text[1:-1], ",")
+        if len(parts) > 1:
+            values = tuple(parse_answer_value(part) for part in parts)
+            if all(value is not None for value in values):
+                return values
+
+    latex_fraction = re.fullmatch(
+        r"\\(?:dfrac|tfrac|frac)\s*\{([^{}]+)\}\s*\{([^{}]+)\}",
+        text,
+    )
+    if latex_fraction:
+        numerator = parse_answer_value(latex_fraction.group(1))
+        denominator = parse_answer_value(latex_fraction.group(2))
+        if isinstance(numerator, Fraction) and isinstance(denominator, Fraction):
+            if denominator:
+                return numerator / denominator
+            return None
+
+    fraction = re.fullmatch(rf"({_ANSWER_NUMBER})\s*/\s*({_ANSWER_NUMBER})", text)
+    if fraction:
+        denominator = Fraction(fraction.group(2))
+        return Fraction(fraction.group(1)) / denominator if denominator else None
+    if re.fullmatch(_ANSWER_NUMBER, text):
+        return Fraction(text)
+    return None
+
+
+def normalize_answer_text(text: str) -> str:
+    return " ".join(_normalize_answer_surface(text).casefold().split())
+
+
+def _normalize_answer_surface(text: str) -> str:
+    text = _strip_terminal_punctuation(text.strip())
+    text = text.replace("$", "").replace("\\(", "").replace("\\)", "")
+    text = re.sub(r"\\(?:left|right|displaystyle)\b", "", text)
+    text = text.replace("\\,", " ").replace("−", "-")
+    return " ".join(text.split())
+
+
+def _strip_terminal_punctuation(text: str) -> str:
+    text = text.rstrip()
+    text = text.rstrip("!?").rstrip()
+    if text.endswith("."):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _split_top_level(text: str, separator: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(text):
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        elif character == separator and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    parts.append(text[start:].strip())
+    return parts

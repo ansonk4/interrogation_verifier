@@ -15,9 +15,18 @@ from graph_verifier.core.graph import (
     select_verification_target,
     target_signature,
 )
-from graph_verifier.core.models import QUERY_TARGET, Case, Edge, Graph, Node, Verification
+from graph_verifier.core.models import (
+    QUERY_TARGET,
+    Case,
+    Edge,
+    Graph,
+    Node,
+    Verification,
+    answer_claim_matches,
+)
 from graph_verifier.core.verify import (
     ClaimCheck,
+    check_answer_edge,
     check_closed_calculation,
     check_grounding,
     safe_eval,
@@ -1224,6 +1233,79 @@ def test_answer_endpoint_is_canonicalized_from_agent_answer():
     assert graph.nodes[0].claim == "answer 3/5"
 
 
+def test_answer_matching_preserves_math_punctuation_and_structure():
+    assert answer_claim_matches("answer 2", "answer 2")
+    assert answer_claim_matches("answer 187.5", "187.5")
+    assert not answer_claim_matches("answer 187.5", "1875")
+    assert answer_claim_matches("answer (4,4)", "(4, 4)")
+    assert not answer_claim_matches("answer (4,4)", "(44)")
+    assert answer_claim_matches(r"answer \frac{1}{3}", "1/3")
+
+
+def test_coverage_matches_decimal_coordinate_and_fraction_answers():
+    for answer, claim in [
+        ("187.5", "answer 187.5"),
+        ("(4,4)", "answer (4, 4)"),
+        ("1/3", r"answer \frac{1}{3}"),
+    ]:
+        graph = Graph(
+            nodes=[
+                Node(
+                    "query",
+                    "requested value",
+                    QUERY_TARGET,
+                    decisive=True,
+                    verification=Verification("valid", "grounded"),
+                ),
+                Node(
+                    "result",
+                    "verified result",
+                    decisive=True,
+                    verification=Verification("valid", "supported"),
+                ),
+                Node(
+                    "answer",
+                    claim,
+                    "answer",
+                    decisive=True,
+                    verification=Verification("valid", "supported"),
+                ),
+            ],
+            edges=[
+                Edge(
+                    "finish",
+                    ["query", "result"],
+                    "answer",
+                    "the verified result answers the query",
+                    decisive=True,
+                    verification=Verification("valid", "supported"),
+                )
+            ],
+        )
+        assert verify_coverage(Case("case", "question", answer, ""), graph).status == "valid"
+
+
+def test_verified_terminal_value_maps_to_structured_answer():
+    decimal = check_answer_edge(
+        [Node("result", "value = 187.5")],
+        Node("answer", "answer 187.5", "answer"),
+        True,
+    )
+    coordinate = check_answer_edge(
+        [Node("result", "midpoint = (4,4)")],
+        Node("answer", "answer (4, 4)", "answer"),
+        True,
+    )
+    expression = check_answer_edge(
+        [Node("result", "value = 2 + 2")],
+        Node("answer", "answer 4", "answer"),
+        True,
+    )
+    assert decimal is not None and decimal.status == "valid"
+    assert coordinate is not None and coordinate.status == "valid"
+    assert expression is not None and expression.status == "valid"
+
+
 def test_latex_wrappers_do_not_break_exact_grounding():
     check = check_grounding(
         "Find the least positive integer value of $x$ for which $x>1$.",
@@ -1249,6 +1331,10 @@ def test_observed_mvp_math_syntax_is_locally_executable():
     assert check_closed_calculation("11 < sqrt(140) < 12").status == "valid"
     assert check_closed_calculation("11 < √140 < 12").status == "valid"
     assert check_closed_calculation("235 - 221 = 14 and 235 + 221 = 456").status == "valid"
+    assert (
+        check_closed_calculation("average of 80 and 90 = (80+90)/2 = 85").status
+        == "valid"
+    )
 
 
 def test_closed_math_does_not_depend_on_extractor_kind():
@@ -2213,6 +2299,9 @@ if __name__ == "__main__":
         test_edge_verifier_exception_is_tool_error,
         test_non_decisive_edge_cannot_promote_a_decisive_node,
         test_answer_endpoint_is_canonicalized_from_agent_answer,
+        test_answer_matching_preserves_math_punctuation_and_structure,
+        test_coverage_matches_decimal_coordinate_and_fraction_answers,
+        test_verified_terminal_value_maps_to_structured_answer,
         test_latex_wrappers_do_not_break_exact_grounding,
         test_observed_mvp_math_syntax_is_locally_executable,
         test_closed_math_does_not_depend_on_extractor_kind,

@@ -18,7 +18,10 @@ from graph_verifier.core.models import (
     Node,
     Verification,
     answer_claim_matches,
+    answer_claim_payload,
+    answer_claim_value,
     graph_id_error,
+    parse_answer_value,
 )
 from graph_verifier.utils.llm import LLMError, complete_json
 
@@ -278,7 +281,7 @@ def exposed_numbers(check: ClaimCheck) -> set[Fraction]:
 
 
 def verify_coverage(case: Case, graph: Graph) -> Verification:
-    answer = normalize_text(case.agent_answer)
+    answer = case.agent_answer.strip()
     node_by_id = {node.id: node for node in graph.nodes}
     query_target_ids = {node.id for node in graph.nodes if node.kind == QUERY_TARGET}
     if not query_target_ids:
@@ -349,19 +352,29 @@ def check_claim(claim: str, known_numbers: set[Fraction]) -> ClaimCheck:
 
 
 def check_closed_calculation(claim: str) -> ClaimCheck:
-    parts = re.split(r"\s+and\s+", claim, flags=re.IGNORECASE)
+    whole = check_claim(claim, set(numbers_in(claim)))
+    if whole.status != DEBT:
+        return whole
+    parts = split_calculation_conjunctions(claim)
+    if len(parts) == 1:
+        return whole
     checks = [check_claim(part, set(numbers_in(part))) for part in parts]
-    if len(checks) > 1:
-        if all(check.status == VALID for check in checks):
-            return ClaimCheck(
-                VALID,
-                "computed",
-                result=checks[-1].result,
-                inputs=[value for check in checks for value in check.inputs],
-            )
-        refuted = next((check for check in checks if check.status == REFUTED), None)
-        return refuted or ClaimCheck(DEBT, "not locally computable")
-    return checks[0]
+    if all(check.status == VALID for check in checks):
+        return ClaimCheck(
+            VALID,
+            "computed",
+            result=checks[-1].result,
+            inputs=[value for check in checks for value in check.inputs],
+        )
+    refuted = next((check for check in checks if check.status == REFUTED), None)
+    return refuted or ClaimCheck(DEBT, "not locally computable")
+
+
+def split_calculation_conjunctions(claim: str) -> list[str]:
+    parts = re.split(r"\s+and\s+", claim, flags=re.IGNORECASE)
+    if len(parts) > 1 and all(re.search(r"(?:<=|>=|=|<|>)", part) for part in parts):
+        return parts
+    return [claim]
 
 
 def check_answer_edge(
@@ -369,16 +382,18 @@ def check_answer_edge(
 ) -> ClaimCheck | None:
     if len(premises) != 1 or target.kind != "answer" or not premise_supported:
         return None
-    answer_text = normalize_text(target.claim).removeprefix("answer ")
-    answer = safe_eval(answer_text)
+    answer = answer_claim_value(target.claim)
+    if answer is None:
+        evaluated_answer = safe_eval(answer_claim_payload(target.claim))
+        answer = evaluated_answer.value if evaluated_answer is not None else None
     if answer is None:
         return None
-    value = terminal_value(premises[0].claim)
-    if value is not None:
-        return (
-            ClaimCheck(VALID, "verified result is the stated answer", result=answer.value)
-            if value.value == answer.value
-            else None
+    value = terminal_answer_value(premises[0].claim)
+    if value == answer:
+        return ClaimCheck(
+            VALID,
+            "verified result is the stated answer",
+            result=answer if isinstance(answer, Fraction) else None,
         )
     return None
 
@@ -409,6 +424,17 @@ def terminal_value(claim: str) -> EvalResult | None:
         value = safe_eval(part.strip(" .;"))
         if value is not None:
             return value
+    return None
+
+
+def terminal_answer_value(claim: str) -> object | None:
+    for part in reversed(claim.split("=")):
+        value = parse_answer_value(part.strip(" .;"))
+        if value is not None:
+            return value
+        evaluated = safe_eval(part.strip(" .;"))
+        if evaluated is not None:
+            return evaluated.value
     return None
 
 
