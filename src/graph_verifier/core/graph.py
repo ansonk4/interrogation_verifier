@@ -310,7 +310,15 @@ def apply_interrogation_update(
             answer_ids,
         )
         scoped = mutations_support_target(graph, candidate, target_type, target_id, answer_ids)
-        if not changed or not resolved or not bounded or not connected or not scoped:
+        answer_supported = preserves_answer_support(graph, candidate, answer_ids)
+        if (
+            not changed
+            or not resolved
+            or not bounded
+            or not connected
+            or not scoped
+            or not answer_supported
+        ):
             return InterrogationUpdateResult(False, "interrogation did not resolve target")
     if not changed:
         return InterrogationUpdateResult(False, "interrogation did not change graph")
@@ -552,6 +560,24 @@ def mutations_support_target(
     return not changed_nodes and len(changed_edges) <= 1 and changed_edges <= allowed_edges
 
 
+def preserves_answer_support(before: Graph, after: Graph, answer_node_ids: set[str]) -> bool:
+    def supported_answers(graph: Graph) -> set[str]:
+        node_ids = {node.id for node in graph.nodes}
+        return {
+            answer_id
+            for answer_id in answer_node_ids
+            if any(
+                edge.target_node_id == answer_id
+                and edge.premise_node_ids
+                and all(node_id in node_ids for node_id in edge.premise_node_ids)
+                for edge in graph.edges
+            )
+        }
+
+    supported_before = supported_answers(before)
+    return not supported_before or bool(supported_answers(after))
+
+
 def answer_ancestry(graph: Graph, starts: set[str]) -> tuple[set[str], set[str]]:
     incoming: dict[str, list[Edge]] = {}
     for edge in graph.edges:
@@ -703,6 +729,7 @@ def select_verification_target(
         return None
 
     candidate: tuple[str, str] | None = None
+    candidate_reason: str | None = None
     for answer in graph.nodes:
         if answer.decisive and answer.kind == "answer":
             candidate = causal_target(answer.id, set())
@@ -740,7 +767,30 @@ def select_verification_target(
 
     if candidate is None and graph.coverage_decisive:
         if graph.coverage_verification.status == DEBT:
-            candidate = "coverage", "coverage"
+            coverage_reason = graph.coverage_verification.reason
+            if coverage_reason in {
+                "missing query target",
+                "query target not on valid answer path",
+            }:
+                answer_ids = {
+                    node.id
+                    for node in graph.nodes
+                    if node.decisive and node.kind == "answer"
+                }
+                answer_edges = [
+                    edge
+                    for edge in graph.edges
+                    if edge.decisive and edge.target_node_id in answer_ids
+                ]
+                if len(answer_edges) == 1:
+                    candidate = "edge", answer_edges[0].id
+                    candidate_reason = (
+                        "missing dedicated query target"
+                        if coverage_reason == "missing query target"
+                        else "query target is not connected"
+                    )
+            if candidate is None:
+                candidate = "coverage", "coverage"
     if candidate is None:
         return None
 
@@ -770,7 +820,7 @@ def select_verification_target(
             "target_node": None,
             "target_edge": edge_prompt_data(edge),
             "target_coverage": False,
-            "target_reason": edge.verification.reason,
+            "target_reason": candidate_reason or edge.verification.reason,
         }
     return {
         "target_type": "coverage",
@@ -939,111 +989,19 @@ def save_interrogation_graph(artifact_dir: Path | None, case_id: str, graph: Gra
     write_json(artifact_dir / f"{case_name(case_id)}.graph.interrogate_latest.json", graph.to_dict())
 
 
-def mark_decisive(case: Case, graph: Graph) -> Graph:
+def prepare_answer_candidates(case: Case, graph: Graph) -> Graph:
     for node in graph.nodes:
         node.decisive = False
     for edge in graph.edges:
         edge.decisive = False
     graph.coverage_decisive = True
-
-    try:
-        review = complete_json(
-            "decisiveness.md",
-            {
-                "question": case.question,
-                "agent_answer": case.agent_answer,
-                "agent_reasoning": case.agent_reasoning,
-                "graph": {
-                    "nodes": [
-                        {"id": node.id, "claim": node.claim, "kind": node.kind}
-                        for node in graph.nodes
-                    ],
-                    "edges": [
-                        {
-                            "id": edge.id,
-                            "premise_node_ids": edge.premise_node_ids,
-                            "target_node_id": edge.target_node_id,
-                            "claim": edge.claim,
-                        }
-                        for edge in graph.edges
-                    ],
-                    "coverage_claim": graph.coverage_claim,
-                },
-            },
-        )
-        node_flags = bool_map(review, "nodes")
-        edge_flags = bool_map(review, "edges")
-        if not isinstance(review.get("coverage", True), bool):
-            raise TypeError("coverage must be boolean")
-    except (LLMError, KeyError, TypeError, ValueError) as exc:
-        graph.tool_debt.append(f"decisiveness failed: {exc}")
-        return graph
-
-    nodes_by_id = {node.id: node for node in graph.nodes}
-    for node_id, decisive in node_flags.items():
-        if decisive and node_id in nodes_by_id:
-            nodes_by_id[node_id].decisive = True
-    edges_by_id = {edge.id: edge for edge in graph.edges}
-    for edge_id, decisive in edge_flags.items():
-        if decisive and edge_id in edges_by_id:
-            edges_by_id[edge_id].decisive = True
-    prune_decisive_to_answer(case, graph)
-    complete_decisive_support(case, graph)
-    graph.coverage_decisive = True
-    return graph
-
-
-def prune_decisive_to_answer(case: Case, graph: Graph) -> None:
     answer_ids = matching_answer_ids(case, graph)
-    incoming: dict[str, list[Edge]] = {}
-    for edge in graph.edges:
-        if edge.decisive:
-            incoming.setdefault(edge.target_node_id, []).append(edge)
-    decisive_nodes = set(answer_ids)
-    decisive_edges: set[str] = set()
-    stack = list(answer_ids)
-    while stack:
-        node_id = stack.pop()
-        for edge in incoming.get(node_id, []):
-            if edge.id in decisive_edges:
-                continue
-            decisive_edges.add(edge.id)
-            decisive_nodes.add(edge.target_node_id)
-            for premise_id in edge.premise_node_ids:
-                if premise_id not in decisive_nodes:
-                    decisive_nodes.add(premise_id)
-                    stack.append(premise_id)
+    decisive_nodes, decisive_edges = answer_ancestry(graph, answer_ids)
     for node in graph.nodes:
         node.decisive = node.id in decisive_nodes
     for edge in graph.edges:
         edge.decisive = edge.id in decisive_edges
-
-
-def complete_decisive_support(case: Case, graph: Graph) -> None:
-    nodes_by_id = {node.id: node for node in graph.nodes}
-    incoming: dict[str, list[Edge]] = {}
-    for edge in graph.edges:
-        incoming.setdefault(edge.target_node_id, []).append(edge)
-    stack = [node.id for node in graph.nodes if node.decisive]
-    seen: set[str] = set()
-    while stack:
-        node_id = stack.pop()
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-        node = nodes_by_id[node_id]
-        if node_is_independently_supported(case.question, node):
-            continue
-        support = incoming.get(node_id, [])
-        if any(edge.decisive for edge in support) or len(support) != 1:
-            continue
-        edge = support[0]
-        edge.decisive = True
-        for premise_id in edge.premise_node_ids:
-            premise = nodes_by_id.get(premise_id)
-            if premise is not None and not premise.decisive:
-                premise.decisive = True
-                stack.append(premise_id)
+    return graph
 
 
 def matching_answer_ids(case: Case, graph: Graph) -> set[str]:
@@ -1053,18 +1011,6 @@ def matching_answer_ids(case: Case, graph: Graph) -> set[str]:
         if node.kind == "answer"
         and answer_claim_matches(node.claim, case.agent_answer)
     }
-
-
-def bool_map(data: dict[str, object], key: str) -> dict[str, bool]:
-    value = data[key]
-    if not isinstance(value, dict):
-        raise TypeError(f"{key} must be an object")
-    out: dict[str, bool] = {}
-    for item_id, decisive in value.items():
-        if not isinstance(decisive, bool):
-            raise TypeError(f"{key}.{item_id} must be boolean")
-        out[str(item_id)] = decisive
-    return out
 
 
 def id_list(data: dict[str, object], key: str) -> list[str]:

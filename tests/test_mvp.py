@@ -11,7 +11,7 @@ from graph_verifier.core.graph import (
     apply_interrogation_update,
     canonicalize_answer_node,
     interrogate,
-    mark_decisive,
+    prepare_answer_candidates,
     select_verification_target,
     target_signature,
 )
@@ -76,27 +76,10 @@ def status_for(
     graph: Graph,
     answer: str = "A",
     question: str = QUESTION,
-    review: dict | None = None,
-    reviewer_error: Exception | None = None,
     edge_statuses: dict[str, str] | None = None,
 ) -> str:
     case = Case("case", question, answer, "")
-    if review is None:
-        review = {
-            "nodes": {node.id: True for node in graph.nodes},
-            "edges": {edge.id: True for edge in graph.edges},
-            "coverage": True,
-            "reasons": {},
-        }
-
-    def fake_complete_json(prompt_name, data):
-        assert prompt_name == "decisiveness.md"
-        if reviewer_error:
-            raise reviewer_error
-        return review
-
-    with patch("graph_verifier.core.graph.complete_json", side_effect=fake_complete_json):
-        mark_decisive(case, graph)
+    prepare_answer_candidates(case, graph)
 
     edge_statuses = {"e2": "valid"} if edge_statuses is None else edge_statuses
 
@@ -170,19 +153,13 @@ def test_edge_cannot_use_numbers_missing_from_premises():
     assert status_for(graph) == "coverage_debt"
 
 
-def test_decisive_edge_forces_its_premises_decisive():
+def test_selected_proof_includes_all_edge_premises():
     graph = complete_graph()
-    review = {
-        "nodes": {"n1": True, "n2": False, "n3": True, "n4": True},
-        "edges": {"e1": True, "e2": True},
-        "coverage": True,
-        "reasons": {},
-    }
-    assert status_for(graph, review=review) == "verified_reliable"
+    assert status_for(graph) == "verified_reliable"
     assert all(node.decisive for node in graph.nodes)
 
 
-def test_decisive_node_pulls_in_sole_support_edge():
+def test_candidate_cone_pulls_in_answer_support():
     case = Case("case", "Given fraction equality, find x.", "1", "")
     graph = Graph(
         nodes=[
@@ -196,14 +173,7 @@ def test_decisive_node_pulls_in_sole_support_edge():
             Edge("finish", ["query", "derived"], "answer", "therefore answer 1"),
         ],
     )
-    review = {
-        "nodes": {"query": True, "given": True, "derived": True, "answer": True},
-        "edges": {"support": False, "finish": True},
-        "coverage": True,
-        "reasons": {},
-    }
-    with patch("graph_verifier.core.graph.complete_json", return_value=review):
-        mark_decisive(case, graph)
+    prepare_answer_candidates(case, graph)
 
     assert all(node.decisive for node in graph.nodes)
     assert all(edge.decisive for edge in graph.edges)
@@ -919,7 +889,7 @@ def test_interrogation_reports_debt_when_targets_remain_after_max_rounds():
     assert graph.tool_debt == ["interrogation reached max rounds: 2"]
 
 
-def test_reviewer_selected_incomplete_graph_gets_coverage_debt():
+def test_incomplete_answer_cone_gets_coverage_debt():
     graph = Graph(
         nodes=[
             Node("n1", "100 / 40 = 2.5", "calculation"),
@@ -928,13 +898,7 @@ def test_reviewer_selected_incomplete_graph_gets_coverage_debt():
         edges=[Edge("e1", ["n1"], "n2", "2.5 < 3")],
         coverage_claim="n1 -> e1 -> n2",
     )
-    review = {
-        "nodes": {"n1": True, "n2": True},
-        "edges": {"e1": True},
-        "coverage": True,
-        "reasons": {"coverage": "missing Provider B calculation"},
-    }
-    assert status_for(graph, review=review) == "coverage_debt"
+    assert status_for(graph) == "coverage_debt"
 
 
 def test_supplied_decisive_labels_are_ignored():
@@ -961,20 +925,17 @@ def test_supplied_decisive_labels_are_ignored():
     assert not any(edge.decisive for edge in graph.edges)
     assert graph.coverage_decisive
 
-    review = {"nodes": {"n1": False, "n2": False}, "edges": {"e1": False}, "coverage": True, "reasons": {}}
-    assert status_for(graph, review=review) == "coverage_debt"
+    assert status_for(graph) == "coverage_debt"
     assert all(node.decisive for node in graph.nodes)
     assert graph.edges[0].decisive
     assert graph.coverage_decisive
 
 
-def test_reviewer_failure_is_tool_error():
+def test_candidate_selection_does_not_require_an_llm():
     graph = complete_graph()
-    assert status_for(graph, reviewer_error=LLMError("down")) == "tool_error"
-    assert graph.tool_debt == ["decisiveness failed: down"]
-    assert not any(node.decisive for node in graph.nodes)
-    assert not any(edge.decisive for edge in graph.edges)
-    assert graph.coverage_decisive
+    with patch("graph_verifier.core.graph.complete_json", side_effect=LLMError("down")):
+        assert status_for(graph) == "verified_reliable"
+    assert graph.tool_debt == []
 
 
 def test_late_tool_error_does_not_override_valid_proof():
@@ -1592,6 +1553,33 @@ def test_one_malformed_edge_does_not_block_repairing_another():
     assert graph.edges[1].premise_node_ids == ["missing"]
 
 
+def test_interrogation_cannot_retarget_the_only_answer_edge_away_from_answer():
+    graph = Graph(
+        nodes=[
+            Node("premise", "given", "premise"),
+            Node("answer", "answer A", "answer"),
+        ],
+        edges=[Edge("target", ["premise"], "answer", "given supports A")],
+    )
+    update = {
+        "new_nodes": [],
+        "new_edges": [],
+        "updates": [{"id": "target", "target_node_id": "premise"}],
+        "debt": [],
+    }
+
+    result = apply_interrogation_update(
+        graph,
+        update,
+        target_type="edge",
+        target_id="target",
+        answer_node_ids={"answer"},
+    )
+
+    assert not result
+    assert graph.edges[0].target_node_id == "answer"
+
+
 def test_deduplication_preserves_case_sensitive_symbols():
     graph = Graph(nodes=[Node("lower", "x = 1", "calculation"), Node("answer", "answer A", "answer")])
     update = {
@@ -1612,7 +1600,7 @@ def test_deduplication_preserves_case_sensitive_symbols():
     assert graph.edges[0].premise_node_ids == ["upper"]
 
 
-def test_decisiveness_drops_disconnected_branch():
+def test_candidate_cone_drops_disconnected_branch():
     case = Case("case", QUESTION, "A", "")
     graph = Graph(
         nodes=[
@@ -1626,17 +1614,62 @@ def test_decisiveness_drops_disconnected_branch():
             Edge("other_edge", ["other1"], "other2", "3 > 2.5"),
         ],
     )
-    review = {
-        "nodes": {node.id: True for node in graph.nodes},
-        "edges": {edge.id: True for edge in graph.edges},
-        "coverage": False,
-        "reasons": {},
-    }
-    with patch("graph_verifier.core.graph.complete_json", return_value=review):
-        mark_decisive(case, graph)
+    prepare_answer_candidates(case, graph)
     assert [node.id for node in graph.nodes if node.decisive] == ["main", "answer"]
     assert [edge.id for edge in graph.edges if edge.decisive] == ["main_edge"]
     assert graph.coverage_decisive
+
+
+def test_verified_alternative_is_selected_after_all_answer_paths_are_checked():
+    case = Case("case", QUESTION, "A", "")
+    graph = Graph(
+        nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET),
+            Node("bad", "100 / 40 = 3", "calculation"),
+            Node("good", "100 / 40 = 2.5", "calculation"),
+            Node("answer", "answer A", "answer"),
+        ],
+        edges=[
+            Edge("bad_edge", ["query", "bad"], "answer", "choose A from the bad result"),
+            Edge("good_edge", ["query", "good"], "answer", "choose A from the unit price"),
+        ],
+    )
+
+    prepare_answer_candidates(case, graph)
+    assert all(node.decisive for node in graph.nodes)
+    assert all(edge.decisive for edge in graph.edges)
+
+    verify_graph(case, graph, lambda *args: ClaimCheck("valid", "answer follows"))
+
+    assert final_status(graph).status == "verified_reliable"
+    assert {node.id for node in graph.nodes if node.decisive} == {"query", "good", "answer"}
+    assert {edge.id for edge in graph.edges if edge.decisive} == {"good_edge"}
+    assert graph.nodes[1].verification.status == "refuted"
+
+
+def test_smallest_complete_verified_proof_is_selected():
+    case = Case("case", QUESTION, "A", "")
+    graph = Graph(
+        nodes=[
+            Node("query", "provider is cheaper", QUERY_TARGET),
+            Node("direct", "100 / 40 = 2.5", "calculation"),
+            Node("root", "100 / 40 = 2.5", "calculation"),
+            Node("derived", "Provider A has unit price 2.5", "derived"),
+            Node("answer", "answer A", "answer"),
+        ],
+        edges=[
+            Edge("derive", ["root"], "derived", "the quotient is the unit price"),
+            Edge("long", ["query", "derived"], "answer", "choose A"),
+            Edge("short", ["query", "direct"], "answer", "choose A"),
+        ],
+    )
+
+    prepare_answer_candidates(case, graph)
+    verify_graph(case, graph, lambda *args: ClaimCheck("valid", "supported"))
+
+    assert final_status(graph).status == "verified_reliable"
+    assert {node.id for node in graph.nodes if node.decisive} == {"query", "direct", "answer"}
+    assert {edge.id for edge in graph.edges if edge.decisive} == {"short"}
 
 
 def test_coverage_requires_an_explicit_answer_node():
@@ -1877,6 +1910,44 @@ def test_verification_feedback_selects_causal_edge():
     assert target["target_reason"] == "edge claim does not establish target"
 
 
+def test_verification_feedback_anchors_query_gap_to_the_answer_edge():
+    graph = Graph(
+        nodes=[
+            Node(
+                "result",
+                "1 + 1 = 2",
+                decisive=True,
+                verification=Verification("valid", "computed"),
+            ),
+            Node(
+                "answer",
+                "answer 2",
+                "answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            ),
+        ],
+        edges=[
+            Edge(
+                "finish",
+                ["result"],
+                "answer",
+                "the result is the answer",
+                decisive=True,
+                verification=Verification("valid", "supported"),
+            )
+        ],
+        coverage_verification=Verification("debt", "missing query target"),
+    )
+
+    target = select_verification_target(graph)
+
+    assert target is not None
+    assert target["target_type"] == "edge"
+    assert target["target_id"] == "finish"
+    assert target["target_reason"] == "missing dedicated query target"
+
+
 def test_verification_feedback_follows_debt_to_root_node():
     graph = Graph(
         nodes=[
@@ -2017,22 +2088,22 @@ def test_forced_feedback_target_passes_exact_verifier_reason():
 def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
     case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
     graph = verification_feedback_graph()
-    calls = {"interrogate": 0, "decisive": 0, "verify": 0}
+    calls = {"interrogate": 0, "candidates": 0, "verify": 0}
 
     def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
         assert case_arg is case
         assert graph_arg is graph
         calls["interrogate"] += 1
-        if forced_target is not None:
-            assert forced_target["target_id"] == "cause"
-            graph_arg.edges[0].claim = "repaired rule"
-            state.rounds_used += 1
+        assert forced_target is not None
+        assert forced_target["target_id"] == "cause"
+        graph_arg.edges[0].claim = "repaired rule"
+        state.rounds_used += 1
         return graph_arg
 
-    def fake_decisive(case_arg, graph_arg):
+    def fake_candidates(case_arg, graph_arg):
         assert case_arg is case
         assert graph_arg is graph
-        calls["decisive"] += 1
+        calls["candidates"] += 1
         for item in [*graph_arg.nodes, *graph_arg.edges]:
             item.decisive = True
         return graph_arg
@@ -2049,7 +2120,7 @@ def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
 
     with (
         patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
-        patch("graph_verifier.main.mark_decisive", side_effect=fake_decisive),
+        patch("graph_verifier.main.prepare_answer_candidates", side_effect=fake_candidates),
         patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
         patch("graph_verifier.main.save_graph"),
     ):
@@ -2062,7 +2133,7 @@ def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
         )
 
     assert result is graph
-    assert calls == {"interrogate": 2, "decisive": 2, "verify": 2}
+    assert calls == {"interrogate": 1, "candidates": 2, "verify": 2}
     assert final_status(graph).status == "verified_reliable"
 
 
@@ -2084,36 +2155,39 @@ def test_feedback_pipeline_enforces_one_global_repair_budget():
 
     with (
         patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
-        patch("graph_verifier.main.mark_decisive", side_effect=lambda case_arg, graph_arg: graph_arg),
+        patch(
+            "graph_verifier.main.prepare_answer_candidates",
+            side_effect=lambda case_arg, graph_arg: graph_arg,
+        ),
         patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
         patch("graph_verifier.main.save_graph"),
         patch("graph_verifier.main.save_interrogation_event"),
     ):
         run_interrogation_verification(case, graph, Path("artifacts"), 1)
 
-    assert calls == {"interrogate": 2, "verify": 2}
+    assert calls == {"interrogate": 1, "verify": 2}
     assert graph.tool_debt == ["verification feedback reached max rounds: 1"]
 
 
 def test_feedback_pipeline_stops_without_reverification_on_no_progress():
     case = Case("case", QUESTION, "A", "", agent_model_config=AGENT_MODEL_CONFIG)
     graph = verification_feedback_graph()
-    calls = {"interrogate": 0, "decisive": 0, "verify": 0}
+    calls = {"interrogate": 0, "candidates": 0, "verify": 0}
 
     def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
         calls["interrogate"] += 1
-        if forced_target is not None:
-            state.rounds_used += 1
-            state.handled.add(
-                ("edge", "cause", target_signature(graph_arg, "edge", "cause"))
-            )
-            graph_arg.edges[0].verification = Verification(
-                "debt", "interrogation could not ground"
-            )
+        assert forced_target is not None
+        state.rounds_used += 1
+        state.handled.add(
+            ("edge", "cause", target_signature(graph_arg, "edge", "cause"))
+        )
+        graph_arg.edges[0].verification = Verification(
+            "debt", "interrogation could not ground"
+        )
         return graph_arg
 
-    def fake_decisive(case_arg, graph_arg):
-        calls["decisive"] += 1
+    def fake_candidates(case_arg, graph_arg):
+        calls["candidates"] += 1
         return graph_arg
 
     def fake_verify(case_arg, graph_arg, edge_checker):
@@ -2122,13 +2196,13 @@ def test_feedback_pipeline_stops_without_reverification_on_no_progress():
 
     with (
         patch("graph_verifier.main.interrogate", side_effect=fake_interrogate),
-        patch("graph_verifier.main.mark_decisive", side_effect=fake_decisive),
+        patch("graph_verifier.main.prepare_answer_candidates", side_effect=fake_candidates),
         patch("graph_verifier.main.verify_graph", side_effect=fake_verify),
         patch("graph_verifier.main.save_graph"),
     ):
         run_interrogation_verification(case, graph, Path("artifacts"), 3)
 
-    assert calls == {"interrogate": 2, "decisive": 1, "verify": 1}
+    assert calls == {"interrogate": 1, "candidates": 1, "verify": 1}
     assert graph.edges[0].verification.reason == "interrogation could not ground"
 
 
@@ -2263,8 +2337,8 @@ if __name__ == "__main__":
         test_refuted_comparison_supports_final_answer,
         test_irrelevant_true_edge_does_not_support_answer,
         test_edge_cannot_use_numbers_missing_from_premises,
-        test_decisive_edge_forces_its_premises_decisive,
-        test_decisive_node_pulls_in_sole_support_edge,
+        test_selected_proof_includes_all_edge_premises,
+        test_candidate_cone_pulls_in_answer_support,
         test_interrogation_unsupported_premise_is_debt_not_refutation,
         test_interrogation_without_original_agent_marks_debt,
         test_coverage_gap_anchors_to_only_answer_edge,
@@ -2279,9 +2353,9 @@ if __name__ == "__main__":
         test_interrogation_accepts_all_provenance_receipts,
         test_interrogation_stops_at_max_rounds,
         test_interrogation_reports_debt_when_targets_remain_after_max_rounds,
-        test_reviewer_selected_incomplete_graph_gets_coverage_debt,
+        test_incomplete_answer_cone_gets_coverage_debt,
         test_supplied_decisive_labels_are_ignored,
-        test_reviewer_failure_is_tool_error,
+        test_candidate_selection_does_not_require_an_llm,
         test_late_tool_error_does_not_override_valid_proof,
         test_edge_with_missing_premise_node_is_debt,
         test_edge_with_missing_target_node_is_debt,
@@ -2319,14 +2393,18 @@ if __name__ == "__main__":
         test_coverage_repair_cannot_add_a_different_answer_branch,
         test_target_repair_cannot_mutate_an_unrelated_item,
         test_one_malformed_edge_does_not_block_repairing_another,
+        test_interrogation_cannot_retarget_the_only_answer_edge_away_from_answer,
         test_deduplication_preserves_case_sensitive_symbols,
-        test_decisiveness_drops_disconnected_branch,
+        test_candidate_cone_drops_disconnected_branch,
+        test_verified_alternative_is_selected_after_all_answer_paths_are_checked,
+        test_smallest_complete_verified_proof_is_selected,
         test_coverage_requires_an_explicit_answer_node,
         test_coverage_rejects_numeric_answer_prefixes_and_fractions,
         test_coverage_requires_a_query_target,
         test_coverage_requires_query_target_on_answer_path,
         test_missing_query_target_is_deterministically_repaired,
         test_verification_feedback_selects_causal_edge,
+        test_verification_feedback_anchors_query_gap_to_the_answer_edge,
         test_verification_feedback_follows_debt_to_root_node,
         test_verification_feedback_uses_coverage_only_as_fallback,
         test_verification_feedback_respects_handled_signatures_and_terminal_failures,

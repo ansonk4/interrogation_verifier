@@ -4,6 +4,9 @@
 
 實現說明 — Implementation Specification
 
+> 這是原始設計提案；目前已實作的 verification-first 流程見
+> [verification-system.md](verification-system.md)。
+
 ![](dependency_graph_verifier_spec_副本_media/image1.png)
 
 # 一、這個系統要解決什麼問題

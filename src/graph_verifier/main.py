@@ -18,7 +18,7 @@ from graph_verifier.core.graph import (
     InterrogationState,
     build_graph,
     interrogate,
-    mark_decisive,
+    prepare_answer_candidates,
     save_interrogation_event,
     select_verification_target,
     target_signature,
@@ -110,8 +110,14 @@ def process_case(
                 verify_edge_with_llm,
             )
         else:
-            graph = run_stage("mark_decisive", mark_decisive, case, graph, case_id=case.id)
-            save_graph(artifact_dir, case.id, "mark_decisive", graph)
+            graph = run_stage(
+                "prepare_candidates",
+                prepare_answer_candidates,
+                case,
+                graph,
+                case_id=case.id,
+            )
+            save_graph(artifact_dir, case.id, "prepare_candidates", graph)
             graph = run_stage(
                 "verify_graph",
                 verify_graph,
@@ -135,30 +141,17 @@ def run_interrogation_verification(
     edge_checker=verify_edge_with_llm,
 ) -> Graph:
     state = InterrogationState()
-    graph = run_stage(
-        "interrogate",
-        interrogate,
-        case,
-        graph,
-        artifact_dir,
-        max_interrogation_rounds,
-        state,
-        None,
-        case_id=case.id,
-    )
-    save_graph(artifact_dir, case.id, "interrogate", graph)
-
     feedback_cycle = 0
     while True:
         stage_suffix = "" if feedback_cycle == 0 else f"_feedback_{feedback_cycle}"
         graph = run_stage(
-            "mark_decisive" + stage_suffix,
-            mark_decisive,
+            "prepare_candidates" + stage_suffix,
+            prepare_answer_candidates,
             case,
             graph,
             case_id=case.id,
         )
-        save_graph(artifact_dir, case.id, "mark_decisive", graph)
+        save_graph(artifact_dir, case.id, "prepare_candidates", graph)
         graph = run_stage(
             "verify_graph" + stage_suffix,
             verify_graph,

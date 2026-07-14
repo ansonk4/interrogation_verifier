@@ -2,6 +2,9 @@
 
 ## Implementation Specification
 
+> This is the original design proposal. The implemented verification-first flow is documented in
+> [verification-system.md](verification-system.md).
+
 ## 1. What problem does this system solve?
 
 We consider the following scenario: an AI agent, the examinee, gives an answer and a free-text reasoning process for a question that has an objective answer. We want to use another AI, the reviewer, to judge whether this answer is trustworthy and whether it can be used downstream.

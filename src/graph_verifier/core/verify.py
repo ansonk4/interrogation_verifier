@@ -66,6 +66,13 @@ class ClaimCheck:
     inputs: list[Fraction] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Proof:
+    node_ids: frozenset[str]
+    edge_ids: frozenset[str]
+    has_query_target: bool = False
+
+
 def verify_graph(
     case: Case,
     graph: Graph,
@@ -76,6 +83,8 @@ def verify_graph(
         graph.tool_debt.append(id_error)
         graph.coverage_verification = Verification(DEBT, id_error)
         return graph
+    candidate_node_ids = {node.id for node in graph.nodes if node.decisive}
+    candidate_edge_ids = {edge.id for edge in graph.edges if edge.decisive}
     question_numbers = set(numbers_in(case.question))
     node_by_id = {node.id: node for node in graph.nodes}
     incoming_edges: dict[str, list[Edge]] = {}
@@ -83,6 +92,7 @@ def verify_graph(
         incoming_edges.setdefault(edge.target_node_id, []).append(edge)
     node_numbers: dict[str, set[Fraction]] = {}
     edge_checks: dict[str, ClaimCheck] = {}
+    independent_node_ids: set[str] = set()
 
     for node in graph.nodes:
         if node.kind == "answer":
@@ -95,6 +105,8 @@ def verify_graph(
                 check = check_grounding(case.question, node.claim, node.sources)
         node.verification = Verification(check.status, check.reason)
         node_numbers[node.id] = exposed_numbers(check)
+        if node.kind != "answer" and check.status == VALID:
+            independent_node_ids.add(node.id)
 
     for edge in graph.edges:
         edge.verification = Verification(DEBT, "not verified")
@@ -125,15 +137,134 @@ def verify_graph(
 
     for edge in graph.edges:
         if (
-            edge.decisive
+            edge.id in candidate_edge_ids
             and edge.verification.status == DEBT
             and is_edge_verifier_failure(edge.verification.reason)
         ):
             reason = f"edge verification failed for {edge.id}: {edge.verification.reason}"
             if reason not in graph.tool_debt:
                 graph.tool_debt.append(reason)
+    select_decisive_proof(
+        case,
+        graph,
+        candidate_node_ids,
+        candidate_edge_ids,
+        independent_node_ids,
+    )
     graph.coverage_verification = verify_coverage(case, graph)
     return graph
+
+
+def select_decisive_proof(
+    case: Case,
+    graph: Graph,
+    candidate_node_ids: set[str],
+    candidate_edge_ids: set[str],
+    independent_node_ids: set[str],
+) -> None:
+    node_by_id = {node.id: node for node in graph.nodes}
+    edge_by_id = {edge.id: edge for edge in graph.edges}
+    answer_ids = {
+        node.id
+        for node in graph.nodes
+        if node.id in candidate_node_ids
+        and node.kind == "answer"
+        and answer_claim_matches(node.claim, case.agent_answer)
+    }
+    if not answer_ids:
+        return
+
+    incoming: dict[str, list[Edge]] = {}
+    for edge in graph.edges:
+        if edge.id in candidate_edge_ids:
+            incoming.setdefault(edge.target_node_id, []).append(edge)
+
+    def rank(proof: Proof) -> tuple[object, ...]:
+        items = [
+            *(node_by_id[node_id] for node_id in proof.node_ids if node_id in node_by_id),
+            *(edge_by_id[edge_id] for edge_id in proof.edge_ids if edge_id in edge_by_id),
+        ]
+        return (
+            sum(item.verification.status == REFUTED for item in items),
+            sum(item.verification.status == DEBT for item in items),
+            not proof.has_query_target,
+            len(proof.node_ids) + len(proof.edge_ids),
+            tuple(sorted(proof.node_ids)),
+            tuple(sorted(proof.edge_ids)),
+        )
+
+    def keep_best(options: dict[bool, Proof], proof: Proof) -> None:
+        current = options.get(proof.has_query_target)
+        if current is None or rank(proof) < rank(current):
+            options[proof.has_query_target] = proof
+
+    def proof_options(node_id: str, visiting: frozenset[str]) -> dict[bool, Proof]:
+        node = node_by_id.get(node_id)
+        if node is None or node_id not in candidate_node_ids or node_id in visiting:
+            return {}
+        visiting = visiting | {node_id}
+        options: dict[bool, Proof] = {}
+        support = incoming.get(node_id, [])
+        if node_id in independent_node_ids or not support:
+            keep_best(
+                options,
+                Proof(
+                    frozenset({node_id}),
+                    frozenset(),
+                    node.kind == QUERY_TARGET,
+                ),
+            )
+
+        for edge in support:
+            partials = {False: Proof(frozenset(), frozenset())}
+            for premise_id in edge.premise_node_ids:
+                premise_options = proof_options(premise_id, visiting)
+                if not premise_options:
+                    premise_options = {False: Proof(frozenset(), frozenset())}
+                combined: dict[bool, Proof] = {}
+                for partial in partials.values():
+                    for premise in premise_options.values():
+                        proof = Proof(
+                            partial.node_ids | premise.node_ids,
+                            partial.edge_ids | premise.edge_ids,
+                            partial.has_query_target or premise.has_query_target,
+                        )
+                        keep_best(combined, proof)
+                partials = combined
+            for partial in partials.values():
+                keep_best(
+                    options,
+                    Proof(
+                        partial.node_ids | {node_id},
+                        partial.edge_ids | {edge.id},
+                        partial.has_query_target or node.kind == QUERY_TARGET,
+                    ),
+                )
+
+        if not options:
+            keep_best(
+                options,
+                Proof(
+                    frozenset({node_id}),
+                    frozenset(),
+                    node.kind == QUERY_TARGET,
+                ),
+            )
+        return options
+
+    best: Proof | None = None
+    for answer_id in sorted(answer_ids):
+        for proof in proof_options(answer_id, frozenset()).values():
+            if best is None or rank(proof) < rank(best):
+                best = proof
+    if best is None:
+        return
+
+    for node in graph.nodes:
+        node.decisive = node.id in best.node_ids
+    for edge in graph.edges:
+        edge.decisive = edge.id in best.edge_ids
+    graph.coverage_decisive = True
 
 
 def set_verification(item: Node | Edge, verification: Verification) -> bool:
