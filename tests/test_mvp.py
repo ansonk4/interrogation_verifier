@@ -1704,7 +1704,7 @@ def test_coverage_rejects_numeric_answer_prefixes_and_fractions():
         assert verify_coverage(case, graph).status == "debt"
 
 
-def test_coverage_requires_a_query_target():
+def test_coverage_allows_a_missing_query_target():
     case = Case("case", "What is 1 + 1?", "2", "")
     graph = Graph(
         nodes=[
@@ -1736,11 +1736,10 @@ def test_coverage_requires_a_query_target():
     )
 
     coverage = verify_coverage(case, graph)
-    assert coverage.status == "debt"
-    assert coverage.reason == "missing query target"
+    assert coverage.status == "valid"
 
 
-def test_coverage_requires_query_target_on_answer_path():
+def test_coverage_allows_query_target_off_answer_path():
     case = Case("case", "What is 1 + 1?", "2", "")
     graph = Graph(
         nodes=[
@@ -1778,8 +1777,7 @@ def test_coverage_requires_query_target_on_answer_path():
     )
 
     coverage = verify_coverage(case, graph)
-    assert coverage.status == "debt"
-    assert coverage.reason == "query target not on valid answer path"
+    assert coverage.status == "valid"
 
 
 def test_missing_query_target_is_deterministically_repaired():
@@ -2400,8 +2398,8 @@ if __name__ == "__main__":
         test_smallest_complete_verified_proof_is_selected,
         test_coverage_requires_an_explicit_answer_node,
         test_coverage_rejects_numeric_answer_prefixes_and_fractions,
-        test_coverage_requires_a_query_target,
-        test_coverage_requires_query_target_on_answer_path,
+        test_coverage_allows_a_missing_query_target,
+        test_coverage_allows_query_target_off_answer_path,
         test_missing_query_target_is_deterministically_repaired,
         test_verification_feedback_selects_causal_edge,
         test_verification_feedback_anchors_query_gap_to_the_answer_edge,
