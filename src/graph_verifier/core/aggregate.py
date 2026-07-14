@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from graph_verifier.core.models import DEBT, REFUTED, Graph, StatusResult
+from graph_verifier.core.models import DEBT, REFUTED, VALID, Graph, StatusResult
 
 
 def final_status(graph: Graph) -> StatusResult:
@@ -14,8 +14,15 @@ def final_status(graph: Graph) -> StatusResult:
     if refuted:
         return StatusResult("answer_refuted", "refuted: " + ",".join(refuted))
 
+    valid_proof = graph.coverage_decisive and graph.coverage_verification.status == VALID
+    if valid_proof:
+        reason = "all decisive items valid"
+        if graph.tool_debt:
+            reason += "; non-fatal tool error: " + graph.tool_debt[0]
+        return StatusResult("verified_reliable", reason)
+
     if graph.tool_debt:
-        return StatusResult("verification_debt", "tool: " + graph.tool_debt[0])
+        return StatusResult("tool_error", graph.tool_debt[0])
 
     if graph.coverage_decisive and graph.coverage_verification.status == DEBT:
         return StatusResult("coverage_debt", "coverage")

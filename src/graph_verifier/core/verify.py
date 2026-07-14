@@ -239,17 +239,17 @@ def verify_edge_with_llm(premises: list[Node], edge: Edge, target: Node) -> Clai
         },
     )
     if not isinstance(data, dict):
-        return ClaimCheck(DEBT, "edge verifier did not return an object")
+        return ClaimCheck(DEBT, "edge verifier failed: response is not an object")
     status = str(data.get("status", DEBT)).lower()
     if status not in {VALID, DEBT, REFUTED}:
-        return ClaimCheck(DEBT, "edge verifier returned invalid status")
+        return ClaimCheck(DEBT, "edge verifier failed: invalid status")
     used = data.get("used_premise_node_ids", [])
     if not isinstance(used, list):
-        return ClaimCheck(DEBT, "edge verifier returned invalid premise ids")
+        return ClaimCheck(DEBT, "edge verifier failed: invalid premise ids")
     used_ids = {str(node_id) for node_id in used}
     premise_ids = {node.id for node in premises}
     if used_ids - premise_ids or (status != DEBT and used_ids != premise_ids):
-        return ClaimCheck(DEBT, "edge verifier did not use every premise")
+        return ClaimCheck(DEBT, "edge verifier failed: invalid premise use")
     return ClaimCheck(status, str(data.get("reason", "edge verification"))[:160])
 
 

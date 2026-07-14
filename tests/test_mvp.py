@@ -1,5 +1,7 @@
+import json
 from fractions import Fraction
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Barrier, Lock
 from unittest.mock import patch
 
@@ -957,13 +959,20 @@ def test_supplied_decisive_labels_are_ignored():
     assert graph.coverage_decisive
 
 
-def test_reviewer_failure_is_verification_debt():
+def test_reviewer_failure_is_tool_error():
     graph = complete_graph()
-    assert status_for(graph, reviewer_error=LLMError("down")) == "verification_debt"
+    assert status_for(graph, reviewer_error=LLMError("down")) == "tool_error"
     assert graph.tool_debt == ["decisiveness failed: down"]
     assert not any(node.decisive for node in graph.nodes)
     assert not any(edge.decisive for edge in graph.edges)
     assert graph.coverage_decisive
+
+
+def test_late_tool_error_does_not_override_valid_proof():
+    graph = complete_graph()
+    graph.tool_debt.append("late endpoint failure")
+    assert status_for(graph) == "verified_reliable"
+    assert "non-fatal tool error" in final_status(graph).reason
 
 
 def test_edge_with_missing_premise_node_is_debt():
@@ -1153,9 +1162,24 @@ def test_malformed_edge_verifier_response_becomes_debt():
             Node("target", "conclusion"),
         )
     assert check.status == "debt"
+    assert check.reason == "edge verifier failed: response is not an object"
 
 
-def test_edge_verifier_failure_is_tool_debt():
+def test_decisive_edge_verifier_failure_becomes_tool_error():
+    graph = complete_graph()
+    for node in graph.nodes:
+        node.decisive = True
+    for edge in graph.edges:
+        edge.decisive = True
+    with patch("graph_verifier.core.verify.complete_json", return_value=[]):
+        verify_graph(Case("case", QUESTION, "A", ""), graph, verify_edge_with_llm)
+    assert graph.tool_debt == [
+        "edge verification failed for e2: edge verifier failed: response is not an object"
+    ]
+    assert final_status(graph).status == "tool_error"
+
+
+def test_edge_verifier_exception_is_tool_error():
     case = Case("case", QUESTION, "A", "")
     graph = complete_graph()
     for item in [*graph.nodes, *graph.edges]:
@@ -1168,7 +1192,7 @@ def test_edge_verifier_failure_is_tool_debt():
     assert graph.tool_debt == [
         "edge verification failed for e2: edge verifier failed: endpoint down"
     ]
-    assert final_status(graph).status == "verification_debt"
+    assert final_status(graph).status == "tool_error"
 
 
 def test_non_decisive_edge_cannot_promote_a_decisive_node():
@@ -2028,13 +2052,48 @@ def test_complete_json_retries_a_malformed_response():
     def fake_complete(content, model_config):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if calls < 3:
             raise LLMError("malformed endpoint JSON")
         return '{"ok": true}'
 
-    with patch("graph_verifier.utils.llm.complete", side_effect=fake_complete):
-        assert complete_json("graph_extract.md", {}, attempts=2) == {"ok": True}
-    assert calls == 2
+    with (
+        patch("graph_verifier.utils.llm.complete", side_effect=fake_complete),
+        patch("graph_verifier.utils.llm.time.sleep") as sleep,
+    ):
+        assert complete_json("graph_extract.md", {}) == {"ok": True}
+    assert calls == 3
+    assert [item.args for item in sleep.call_args_list] == [(1.0,), (2.0,)]
+
+
+def test_complete_json_retries_null_content_with_backoff():
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    responses = [
+        FakeResponse({"choices": [{"message": {"content": None}}]}),
+        FakeResponse({"choices": [{"message": {"content": '{"ok": true}'}}]}),
+    ]
+    with TemporaryDirectory() as directory:
+        config = Path(directory) / "model.json"
+        config.write_text(
+            json.dumps({"api_key": "test", "llm_url": "https://example.test", "model": "test"})
+        )
+        with (
+            patch("graph_verifier.utils.llm.urllib.request.urlopen", side_effect=responses),
+            patch("graph_verifier.utils.llm.time.sleep") as sleep,
+        ):
+            assert complete_json("graph_extract.md", {}, config, attempts=2) == {"ok": True}
+    sleep.assert_called_once_with(1.0)
 
 
 def test_compact_output_counts_only_decisive_items():
@@ -2050,10 +2109,11 @@ def test_compact_output_counts_only_decisive_items():
     assert output["debt"] == 0
 
 
-def test_compact_output_counts_tool_debt():
+def test_compact_output_separates_tool_errors_from_debt():
     graph = Graph(tool_debt=["endpoint failed"], coverage_decisive=False)
-    output = compact_output(Case("case", "q", "a", ""), "interrogation", graph, "verification_debt")
-    assert output["debt"] == 1
+    output = compact_output(Case("case", "q", "a", ""), "interrogation", graph, "tool_error")
+    assert output["debt"] == 0
+    assert output["tool_errors"] == 1
 
 
 def test_case_processing_is_concurrent_bounded_and_ordered():
@@ -2135,7 +2195,8 @@ if __name__ == "__main__":
         test_interrogation_reports_debt_when_targets_remain_after_max_rounds,
         test_reviewer_selected_incomplete_graph_gets_coverage_debt,
         test_supplied_decisive_labels_are_ignored,
-        test_reviewer_failure_is_verification_debt,
+        test_reviewer_failure_is_tool_error,
+        test_late_tool_error_does_not_override_valid_proof,
         test_edge_with_missing_premise_node_is_debt,
         test_edge_with_missing_target_node_is_debt,
         test_edge_with_empty_premises_is_debt,
@@ -2148,7 +2209,8 @@ if __name__ == "__main__":
         test_false_edge_claim_cannot_ride_on_a_true_target,
         test_duplicate_ids_fail_closed,
         test_malformed_edge_verifier_response_becomes_debt,
-        test_edge_verifier_failure_is_tool_debt,
+        test_decisive_edge_verifier_failure_becomes_tool_error,
+        test_edge_verifier_exception_is_tool_error,
         test_non_decisive_edge_cannot_promote_a_decisive_node,
         test_answer_endpoint_is_canonicalized_from_agent_answer,
         test_latex_wrappers_do_not_break_exact_grounding,
@@ -2184,8 +2246,9 @@ if __name__ == "__main__":
         test_feedback_pipeline_enforces_one_global_repair_budget,
         test_feedback_pipeline_stops_without_reverification_on_no_progress,
         test_complete_json_retries_a_malformed_response,
+        test_complete_json_retries_null_content_with_backoff,
         test_compact_output_counts_only_decisive_items,
-        test_compact_output_counts_tool_debt,
+        test_compact_output_separates_tool_errors_from_debt,
         test_case_processing_is_concurrent_bounded_and_ordered,
         test_case_processing_rejects_invalid_concurrency,
         test_case_artifact_name_collisions_are_rejected,

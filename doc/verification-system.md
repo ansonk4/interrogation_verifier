@@ -74,6 +74,9 @@ After the final allowed round, one extra target-selection call checks whether wo
 
 #### LLM calls
 
+The counts below are logical calls. Each logical call may make up to three endpoint requests when
+null, malformed, or failed responses require retries.
+
 For a case with `agent_model_config`, target selection is a reviewer call and repair is an original-agent call:
 
 - a round with a target uses **2 calls**: target selection + repair;
@@ -132,9 +135,15 @@ Feedback stops on reliability, refutation, tool failure, explicit agent debt, an
 | `answer_refuted` | A decisive claim or reasoning step is proven false. |
 | `coverage_debt` | The graph does not fully reach the answer. |
 | `node_debt` | A decisive node could not be verified. |
-| `verification_debt` | A decisive edge or verification tool could not be verified. |
+| `verification_debt` | A decisive reasoning edge could not be verified. |
+| `tool_error` | A required model or verification tool failed before a valid decisive proof was established. |
 
 Debt means **insufficient verified support**, not that the answer is necessarily wrong.
+
+LLM responses must contain string content holding a JSON object. Null or malformed content is
+retried up to three times with exponential backoff. A tool error that occurs after a complete,
+valid decisive proof has already been established is retained in the artifact but does not
+override `verified_reliable`.
 
 ## Safety properties
 
