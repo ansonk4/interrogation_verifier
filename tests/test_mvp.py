@@ -54,12 +54,26 @@ def complete_graph(comparison: str = "2.5 < 3", answer: str = "A") -> Graph:
     return Graph(
         nodes=[
             Node("query", "provider is cheaper", QUERY_TARGET, ["question"]),
+            Node(
+                "given_a",
+                "Provider A costs 100 dollars for 40 units",
+                "query_constraint",
+                ["question"],
+            ),
+            Node(
+                "given_b",
+                "Provider B costs 90 dollars for 30 units",
+                "query_constraint",
+                ["question"],
+            ),
             Node("n1", "100 / 40 = 2.5", "calculation"),
             Node("n2", "90 / 30 = 3", "calculation"),
             Node("n3", comparison, "comparison"),
             Node("n4", f"answer {answer}", "answer"),
         ],
         edges=[
+            Edge("given_a_to_n1", ["given_a"], "n1", "100 / 40 = 2.5"),
+            Edge("given_b_to_n2", ["given_b"], "n2", "90 / 30 = 3"),
             Edge("e1", ["n1", "n2"], "n3", comparison),
             Edge(
                 "e2",
@@ -1659,11 +1673,18 @@ def test_verified_alternative_is_selected_after_all_answer_paths_are_checked():
     graph = Graph(
         nodes=[
             Node("query", "provider is cheaper", QUERY_TARGET),
+            Node(
+                "given",
+                "Provider A costs 100 dollars for 40 units",
+                "query_constraint",
+            ),
             Node("bad", "100 / 40 = 3", "calculation"),
             Node("good", "100 / 40 = 2.5", "calculation"),
             Node("answer", "answer A", "answer"),
         ],
         edges=[
+            Edge("bad_support", ["given"], "bad", "100 / 40 = 3"),
+            Edge("good_support", ["given"], "good", "100 / 40 = 2.5"),
             Edge("bad_edge", ["query", "bad"], "answer", "choose A from the bad result"),
             Edge("good_edge", ["query", "good"], "answer", "choose A from the unit price"),
         ],
@@ -1676,9 +1697,17 @@ def test_verified_alternative_is_selected_after_all_answer_paths_are_checked():
     verify_graph(case, graph, lambda *args: ClaimCheck("valid", "answer follows"))
 
     assert final_status(graph).status == "verified_reliable"
-    assert {node.id for node in graph.nodes if node.decisive} == {"query", "good", "answer"}
-    assert {edge.id for edge in graph.edges if edge.decisive} == {"good_edge"}
-    assert graph.nodes[1].verification.status == "refuted"
+    assert {node.id for node in graph.nodes if node.decisive} == {
+        "query",
+        "given",
+        "good",
+        "answer",
+    }
+    assert {edge.id for edge in graph.edges if edge.decisive} == {
+        "good_support",
+        "good_edge",
+    }
+    assert graph.nodes[2].verification.status == "refuted"
 
 
 def test_smallest_complete_verified_proof_is_selected():
@@ -1686,12 +1715,19 @@ def test_smallest_complete_verified_proof_is_selected():
     graph = Graph(
         nodes=[
             Node("query", "provider is cheaper", QUERY_TARGET),
+            Node(
+                "given",
+                "Provider A costs 100 dollars for 40 units",
+                "query_constraint",
+            ),
             Node("direct", "100 / 40 = 2.5", "calculation"),
             Node("root", "100 / 40 = 2.5", "calculation"),
             Node("derived", "Provider A has unit price 2.5", "derived"),
             Node("answer", "answer A", "answer"),
         ],
         edges=[
+            Edge("direct_support", ["given"], "direct", "100 / 40 = 2.5"),
+            Edge("root_support", ["given"], "root", "100 / 40 = 2.5"),
             Edge("derive", ["root"], "derived", "the quotient is the unit price"),
             Edge("long", ["query", "derived"], "answer", "choose A"),
             Edge("short", ["query", "direct"], "answer", "choose A"),
@@ -1702,8 +1738,93 @@ def test_smallest_complete_verified_proof_is_selected():
     verify_graph(case, graph, lambda *args: ClaimCheck("valid", "supported"))
 
     assert final_status(graph).status == "verified_reliable"
-    assert {node.id for node in graph.nodes if node.decisive} == {"query", "direct", "answer"}
-    assert {edge.id for edge in graph.edges if edge.decisive} == {"short"}
+    assert {node.id for node in graph.nodes if node.decisive} == {
+        "query",
+        "given",
+        "direct",
+        "answer",
+    }
+    assert {edge.id for edge in graph.edges if edge.decisive} == {
+        "direct_support",
+        "short",
+    }
+
+
+def test_locally_valid_calculation_cannot_bypass_debt_support():
+    case = Case(
+        "case",
+        "Alice starts with 2 votes and Celia starts with 1 vote. What is Alice's win probability?",
+        "2/3",
+        "",
+    )
+    graph = Graph(
+        nodes=[
+            Node("query", "Alice's win probability", QUERY_TARGET),
+            Node(
+                "given",
+                "Alice starts with 2 votes and Celia starts with 1 vote",
+                "query_constraint",
+            ),
+            Node(
+                "probability",
+                "win probability = 2 / (2 + 1) = 2/3",
+                "calculation",
+            ),
+            Node("answer", "answer 2/3", "answer"),
+        ],
+        edges=[
+            Edge(
+                "unsupported_rule",
+                ["given"],
+                "probability",
+                "the initial vote share equals the win probability",
+            ),
+            Edge(
+                "finish",
+                ["query", "probability"],
+                "answer",
+                "the computed probability answers the query",
+            ),
+        ],
+    )
+    prepare_answer_candidates(case, graph)
+
+    def check_edge(premises, edge, target):
+        if edge.id == "unsupported_rule":
+            return ClaimCheck("debt", "rule is not established")
+        return ClaimCheck("valid", "answer follows")
+
+    verify_graph(case, graph, check_edge)
+
+    assert graph.nodes[2].verification.status == "valid"
+    assert graph.edges[0].verification.status == "debt"
+    assert graph.edges[0].decisive
+    assert final_status(graph).status == "coverage_debt"
+
+
+def test_proof_rejects_an_unsupported_calculation_premise():
+    case = Case("case", "What is the requested value?", "4", "")
+    graph = Graph(
+        nodes=[
+            Node("query", "requested value", QUERY_TARGET),
+            Node("orphan", "2 + 2 = 4", "calculation"),
+            Node("answer", "answer 4", "answer"),
+        ],
+        edges=[
+            Edge(
+                "finish",
+                ["query", "orphan"],
+                "answer",
+                "the calculation gives the requested value",
+            )
+        ],
+    )
+    prepare_answer_candidates(case, graph)
+    verify_graph(case, graph, lambda *args: ClaimCheck("valid", "answer follows"))
+
+    assert graph.nodes[1].verification.status == "valid"
+    assert graph.coverage_verification.reason == "no complete decisive proof"
+    assert final_status(graph).status == "coverage_debt"
 
 
 def test_coverage_requires_an_explicit_answer_node():
@@ -1828,7 +1949,10 @@ def test_missing_query_target_is_deterministically_repaired():
             Node("n5", "32 / 8 = 4", "calculation"),
             Node("answer", "answer 4", "answer"),
         ],
-        edges=[Edge("e6", ["q1", "n5"], "answer", "a is 4, so answer 4")],
+        edges=[
+            Edge("e6", ["q1", "n5"], "answer", "a is 4, so answer 4"),
+            Edge("e5", ["q1"], "n5", "the sequence calculation gives 32 / 8 = 4"),
+        ],
     )
     reviewer_calls = 0
     agent_calls = 0
@@ -2310,7 +2434,7 @@ def test_compact_output_separates_tool_errors_from_debt():
 
 def test_case_processing_is_concurrent_bounded_and_ordered():
     cases = [
-        Case("first", "q", "a", ""),
+        Case("first", "q", "a", "", agent_model_config="case-specific.json"),
         Case("second", "q", "a", ""),
         Case("third", "q", "a", ""),
     ]
@@ -2324,6 +2448,9 @@ def test_case_processing_is_concurrent_bounded_and_ordered():
         assert mode == "interrogation"
         assert artifact_dir == Path("artifacts")
         assert max_interrogation_rounds == 3
+        assert case.agent_model_config == (
+            "case-specific.json" if case.id == "first" else AGENT_MODEL_CONFIG
+        )
         with lock:
             active += 1
             peak = max(peak, active)
@@ -2336,7 +2463,16 @@ def test_case_processing_is_concurrent_bounded_and_ordered():
                 active -= 1
 
     with patch("graph_verifier.main.process_case", side_effect=fake_process):
-        outputs = list(process_cases(cases, "interrogation", Path("artifacts"), 3, 2))
+        outputs = list(
+            process_cases(
+                cases,
+                "interrogation",
+                Path("artifacts"),
+                3,
+                2,
+                AGENT_MODEL_CONFIG,
+            )
+        )
 
     assert peak == 2
     assert [output["id"] for output in outputs] == ["first", "second", "third"]
@@ -2432,6 +2568,8 @@ if __name__ == "__main__":
         test_candidate_cone_drops_disconnected_branch,
         test_verified_alternative_is_selected_after_all_answer_paths_are_checked,
         test_smallest_complete_verified_proof_is_selected,
+        test_locally_valid_calculation_cannot_bypass_debt_support,
+        test_proof_rejects_an_unsupported_calculation_premise,
         test_coverage_requires_an_explicit_answer_node,
         test_coverage_rejects_numeric_answer_prefixes_and_fractions,
         test_coverage_allows_a_missing_query_target,

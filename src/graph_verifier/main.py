@@ -27,7 +27,7 @@ from graph_verifier.core.models import Case, Graph
 from graph_verifier.core.verify import verify_edge_with_llm, verify_graph
 from graph_verifier.utils.artifacts import case_name, write_json
 from graph_verifier.utils.jsonl import read_jsonl
-from graph_verifier.utils.llm import LLMError, complete_json
+from graph_verifier.utils.llm import DEFAULT_MODEL_CONFIG, LLMError, complete_json
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -36,6 +36,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--mode", choices=["direct", "one-shot-graph", "interrogation"], default="interrogation")
     parser.add_argument("--max-interrogation-rounds", type=int, default=20)
     parser.add_argument("--concurrency", type=positive_int, default=30)
+    parser.add_argument(
+        "--agent-model-config",
+        default=str(DEFAULT_MODEL_CONFIG),
+        metavar="PATH",
+        help="fallback interrogation-agent model config when a case does not provide one",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     cases = [Case.from_dict(row) for row in read_jsonl(args.cases)]
     validate_case_names(cases)
@@ -47,6 +53,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         artifact_dir,
         args.max_interrogation_rounds,
         args.concurrency,
+        args.agent_model_config,
     ):
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     logging.info("run end cases=%s", len(cases))
@@ -75,9 +82,16 @@ def process_cases(
     artifact_dir: Path,
     max_interrogation_rounds: int,
     concurrency: int,
+    agent_model_config: str | Path = DEFAULT_MODEL_CONFIG,
 ) -> Iterable[dict[str, Any]]:
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
+    cases = list(cases)
+    if mode == "interrogation":
+        fallback = str(agent_model_config or DEFAULT_MODEL_CONFIG)
+        for case in cases:
+            if not case.agent_model_config:
+                case.agent_model_config = fallback
     action = partial(
         process_case,
         mode=mode,

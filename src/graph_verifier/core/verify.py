@@ -105,7 +105,11 @@ def verify_graph(
                 check = check_grounding(case.question, node.claim, node.sources)
         node.verification = Verification(check.status, check.reason)
         node_numbers[node.id] = exposed_numbers(check)
-        if node.kind != "answer" and check.status == VALID:
+        grounded_root = (
+            node.kind in {"question", "query_constraint", QUERY_TARGET}
+            and check_grounding(case.question, node.claim, node.sources).status == VALID
+        )
+        if check.status == VALID and grounded_root:
             independent_node_ids.add(node.id)
 
     for edge in graph.edges:
@@ -144,14 +148,18 @@ def verify_graph(
             reason = f"edge verification failed for {edge.id}: {edge.verification.reason}"
             if reason not in graph.tool_debt:
                 graph.tool_debt.append(reason)
-    select_decisive_proof(
+    complete_proof = select_decisive_proof(
         case,
         graph,
         candidate_node_ids,
         candidate_edge_ids,
         independent_node_ids,
     )
-    graph.coverage_verification = verify_coverage(case, graph)
+    graph.coverage_verification = (
+        verify_coverage(case, graph)
+        if complete_proof
+        else Verification(DEBT, "no complete decisive proof")
+    )
     return graph
 
 
@@ -161,7 +169,7 @@ def select_decisive_proof(
     candidate_node_ids: set[str],
     candidate_edge_ids: set[str],
     independent_node_ids: set[str],
-) -> None:
+) -> bool:
     node_by_id = {node.id: node for node in graph.nodes}
     edge_by_id = {edge.id: edge for edge in graph.edges}
     answer_ids = {
@@ -172,7 +180,7 @@ def select_decisive_proof(
         and answer_claim_matches(node.claim, case.agent_answer)
     }
     if not answer_ids:
-        return
+        return False
 
     incoming: dict[str, list[Edge]] = {}
     for edge in graph.edges:
@@ -205,7 +213,7 @@ def select_decisive_proof(
         visiting = visiting | {node_id}
         options: dict[bool, Proof] = {}
         support = incoming.get(node_id, [])
-        if node_id in independent_node_ids or not support:
+        if node_id in independent_node_ids:
             keep_best(
                 options,
                 Proof(
@@ -220,7 +228,8 @@ def select_decisive_proof(
             for premise_id in edge.premise_node_ids:
                 premise_options = proof_options(premise_id, visiting)
                 if not premise_options:
-                    premise_options = {False: Proof(frozenset(), frozenset())}
+                    partials = {}
+                    break
                 combined: dict[bool, Proof] = {}
                 for partial in partials.values():
                     for premise in premise_options.values():
@@ -241,15 +250,6 @@ def select_decisive_proof(
                     ),
                 )
 
-        if not options:
-            keep_best(
-                options,
-                Proof(
-                    frozenset({node_id}),
-                    frozenset(),
-                    node.kind == QUERY_TARGET,
-                ),
-            )
         return options
 
     best: Proof | None = None
@@ -258,13 +258,14 @@ def select_decisive_proof(
             if best is None or rank(proof) < rank(best):
                 best = proof
     if best is None:
-        return
+        return False
 
     for node in graph.nodes:
         node.decisive = node.id in best.node_ids
     for edge in graph.edges:
         edge.decisive = edge.id in best.edge_ids
     graph.coverage_decisive = True
+    return True
 
 
 def set_verification(item: Node | Edge, verification: Verification) -> bool:
