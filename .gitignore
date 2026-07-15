@@ -14,3 +14,5 @@ src/graph_verifier/data/competition_math_train/
 src/graph_verifier/data/*.tmp
 logs/
 runs/
+
+benchmark/
