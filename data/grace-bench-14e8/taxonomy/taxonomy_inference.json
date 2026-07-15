@@ -1,0 +1,29 @@
+{
+  "total_categories": 4,
+  "categories": [
+    {
+      "id": "reversed_reasoning",
+      "name": "Reversed Reasoning",
+      "annotator_question": "Did the step get the direction of a relationship backwards?",
+      "definition": "The step reverses or confuses the direction of a logical relationship. This includes swapping cause and effect, treating a sufficient condition as necessary (or vice versa), affirming the consequent, denying the antecedent, or inverting if-then implications."
+    },
+    {
+      "id": "wrong_argument_reading",
+      "name": "Wrong Argument Reading",
+      "annotator_question": "Did the step misidentify what the argument is saying or doing?",
+      "definition": "The step misidentifies the logical structure, roles, or components of an argument. This includes confusing premises with conclusions, mislabeling the type of flaw in an argument, misidentifying the point of disagreement between speakers, or treating distinct concepts as semantically equivalent without textual support."
+    },
+    {
+      "id": "rule_violation",
+      "name": "Rule Violation",
+      "annotator_question": "Did the step ignore or break a constraint stated in the text?",
+      "definition": "The step violates an explicit rule, constraint, or boundary stated in the context. This includes breaking one-to-one mappings, ignoring mutual exclusivity, incorrect set operations, invalid elimination of candidates, violating disjunction logic, or failing at algebraic/combinatorial constraint satisfaction."
+    },
+    {
+      "id": "overreaching_claim",
+      "name": "Overreaching Claim",
+      "annotator_question": "Did the step claim more than the evidence actually supports?",
+      "definition": "The step extends a conclusion beyond what the premises logically support. This includes overgeneralizing from specific cases, misapplying quantifier scope, confusing relative with absolute claims, making unjustified causal attributions, drawing normative conclusions from descriptive facts, or treating absence of evidence as evidence of absence."
+    }
+  ]
+}

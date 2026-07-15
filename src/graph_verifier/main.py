@@ -35,7 +35,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("cases")
     parser.add_argument("--mode", choices=["direct", "one-shot-graph", "interrogation"], default="interrogation")
     parser.add_argument("--max-interrogation-rounds", type=int, default=20)
-    parser.add_argument("--concurrency", type=positive_int, default=10)
+    parser.add_argument("--concurrency", type=positive_int, default=30)
     args = parser.parse_args(list(argv) if argv is not None else None)
     cases = [Case.from_dict(row) for row in read_jsonl(args.cases)]
     validate_case_names(cases)

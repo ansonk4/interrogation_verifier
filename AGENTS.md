@@ -16,6 +16,3 @@ Before modifying repository guidance, check whether `AGENTS.md` already exists a
 
 Use `interrogation` mode by default for graph-verifier runs. It is the main/core method for this repo. Use `direct` or `one-shot-graph` only when the user explicitly requests a baseline/comparison run or asks for that mode by name.
 
-
-## LLM Endpoint Selection
-When code needs to use an LLM endpoint, unless otherwise specified, use `model/openrouter/deepseek/deepseek-v4-flash-high.json` as the default model.

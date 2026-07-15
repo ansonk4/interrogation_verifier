@@ -1,0 +1,29 @@
+{
+  "total_categories": 4,
+  "categories": [
+    {
+      "id": "groundedness_violation",
+      "name": "Groundedness Violation",
+      "annotator_question": "Does the step claim something not supported by the context?",
+      "definition": "The step makes a claim -- whether a fabricated detail, a true-but-unsourced fact from training data, or a plausible-but-ungrounded inference -- that is not supported by the provided context."
+    },
+    {
+      "id": "contradiction",
+      "name": "Contradiction",
+      "annotator_question": "Does the context explicitly say the opposite?",
+      "definition": "The step directly and unambiguously opposes an explicit statement in the context. The context says X; the step says not-X."
+    },
+    {
+      "id": "confusion",
+      "name": "Confusion",
+      "annotator_question": "Did it mix up entities, facts, or relationships?",
+      "definition": "The step uses information that IS in the context, but attaches it to the wrong entity, merges distinct entities, reverses a relationship direction, or confuses properties between entities."
+    },
+    {
+      "id": "evidence_neglect",
+      "name": "Evidence Neglect",
+      "annotator_question": "Does it ignore or deny available information?",
+      "definition": "The step claims information is missing or unavailable when it IS present, or fails to track entity state changes across a narrative."
+    }
+  ]
+}
