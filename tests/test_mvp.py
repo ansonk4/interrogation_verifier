@@ -1282,11 +1282,22 @@ def test_latex_wrappers_do_not_break_exact_grounding():
     assert punctuation.status == "valid"
 
 
+def test_literal_escaped_whitespace_does_not_break_exact_grounding():
+    check = check_grounding(
+        "The arrangement is:\n\nRow 1: 2, 2\n\nRow 2: 4, 4, 4, 4",
+        r"Row 1: 2, 2\n\nRow 2: 4, 4, 4, 4",
+        ["question"],
+    )
+    assert check.status == "valid"
+
+
 def test_observed_mvp_math_syntax_is_locally_executable():
     assert safe_eval("(235-221)(235+221)").value == 6384
     assert safe_eval("3!").value == 6
     assert safe_eval("sqrt(144)").value == 12
     assert safe_eval("11²").value == 121
+    assert safe_eval("11·10").value == 110
+    assert safe_eval(r"11\times10").value == 110
     assert safe_eval(r"\frac{3}{5}").value == Fraction(3, 5)
     assert check_closed_calculation("121 < 140 < 144").status == "valid"
     assert check_closed_calculation("11 < sqrt(140) < 12").status == "valid"
@@ -1295,6 +1306,29 @@ def test_observed_mvp_math_syntax_is_locally_executable():
     assert (
         check_closed_calculation("average of 80 and 90 = (80+90)/2 = 85").status
         == "valid"
+    )
+
+
+def test_inline_variable_assignments_are_not_equation_chain_steps():
+    assert (
+        check_closed_calculation(
+            "$3x^2+5x-1$ at $x=7$ = 3*7^2+5*7-1 = 147+35-1 = 181"
+        ).status
+        == "valid"
+    )
+    assert (
+        check_closed_calculation("$(2x+5)^2$ when x=3 = 11^2 = 121").status
+        == "valid"
+    )
+    assert (
+        check_closed_calculation(
+            "$(a)$ x $(b)$ with $a=3,b=5$ = $(3+5)^2 = 8^2"
+        ).status
+        == "valid"
+    )
+    assert (
+        check_closed_calculation("$(2x+5)^2$ when x=3 = 11^2 = 120").status
+        == "refuted"
     )
 
 
@@ -2375,7 +2409,9 @@ if __name__ == "__main__":
         test_coverage_matches_decimal_coordinate_and_fraction_answers,
         test_verified_terminal_value_maps_to_structured_answer,
         test_latex_wrappers_do_not_break_exact_grounding,
+        test_literal_escaped_whitespace_does_not_break_exact_grounding,
         test_observed_mvp_math_syntax_is_locally_executable,
+        test_inline_variable_assignments_are_not_equation_chain_steps,
         test_closed_math_does_not_depend_on_extractor_kind,
         test_verified_result_can_map_to_canonical_answer,
         test_unconnected_true_number_cannot_become_answer,

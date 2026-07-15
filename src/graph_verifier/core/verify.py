@@ -565,7 +565,7 @@ def terminal_answer_value(claim: str) -> object | None:
 
 
 def check_equation(claim: str, known_numbers: set[Fraction]) -> ClaimCheck:
-    parts = [part.strip(" .;$") for part in claim.split("=")]
+    parts = split_equation_parts(claim)
     if len(parts) < 2:
         return ClaimCheck(DEBT, "no equation")
     first_unsupported: Fraction | None = None
@@ -584,6 +584,19 @@ def check_equation(claim: str, known_numbers: set[Fraction]) -> ClaimCheck:
     if first_unsupported is not None:
         return ClaimCheck(DEBT, "ungrounded input: " + format_fraction(first_unsupported))
     return ClaimCheck(DEBT, "no computable equation")
+
+
+def split_equation_parts(claim: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    for match in re.finditer("=", claim):
+        left = claim[start : match.start()]
+        if re.search(r"(?:^|[\s$,(;])[A-Za-z]\s*$", left):
+            continue
+        parts.append(left.strip(" .;$"))
+        start = match.end()
+    parts.append(claim[start:].strip(" .;$"))
+    return parts
 
 
 def check_comparison(claim: str, known_numbers: set[Fraction]) -> ClaimCheck:
@@ -709,7 +722,13 @@ def clean_expr(text: str) -> str:
     text = re.sub(r"\\sqrt\s*\{([^{}]+)\}", r"sqrt(\1)", text)
     text = re.sub(r"(\d+|\([^()]+\))!", r"factorial(\1)", text)
     text = text.replace("^", "**").replace("$", "").replace(",", "")
-    text = text.replace("\\cdot", "*").replace("×", "*").replace("−", "-")
+    text = (
+        text.replace("\\cdot", "*")
+        .replace("\\times", "*")
+        .replace("×", "*")
+        .replace("·", "*")
+        .replace("−", "-")
+    )
     text = re.sub(r"\s*(?:degrees?|°)\s*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\)\s*\(", ")*(", text)
     text = text.strip()
@@ -734,6 +753,8 @@ def unsupported_inputs(inputs: list[Fraction], known_numbers: set[Fraction]) -> 
 
 
 def normalize_text(text: str) -> str:
+    text = re.sub(r"(?:\\[nrt]){2,}", " ", text)
+    text = re.sub(r"\\[nrt](?![a-z])", " ", text)
     text = text.lower().replace("$", "").replace("\\(", "").replace("\\)", "")
     text = re.sub(r"\\(?:left|right|displaystyle)\b", "", text)
     text = text.replace("²", "^2").replace("³", "^3")
