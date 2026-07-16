@@ -37,6 +37,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--max-interrogation-rounds", type=int, default=20)
     parser.add_argument("--concurrency", type=positive_int, default=30)
     parser.add_argument(
+        "--verifier-model-config",
+        default=str(DEFAULT_MODEL_CONFIG),
+        metavar="PATH",
+        help="verifier/reviewer model config",
+    )
+    parser.add_argument(
         "--agent-model-config",
         default=str(DEFAULT_MODEL_CONFIG),
         metavar="PATH",
@@ -53,7 +59,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         artifact_dir,
         args.max_interrogation_rounds,
         args.concurrency,
-        args.agent_model_config,
+        agent_model_config=args.agent_model_config,
+        verifier_model_config=args.verifier_model_config,
     ):
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     logging.info("run end cases=%s", len(cases))
@@ -83,6 +90,7 @@ def process_cases(
     max_interrogation_rounds: int,
     concurrency: int,
     agent_model_config: str | Path = DEFAULT_MODEL_CONFIG,
+    verifier_model_config: str | Path = DEFAULT_MODEL_CONFIG,
 ) -> Iterable[dict[str, Any]]:
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
@@ -97,6 +105,7 @@ def process_cases(
         mode=mode,
         artifact_dir=artifact_dir,
         max_interrogation_rounds=max_interrogation_rounds,
+        verifier_model_config=verifier_model_config,
     )
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="case") as executor:
         yield from executor.map(action, cases)
@@ -108,12 +117,18 @@ def process_case(
     mode: str,
     artifact_dir: Path,
     max_interrogation_rounds: int,
+    verifier_model_config: str | Path = DEFAULT_MODEL_CONFIG,
 ) -> dict[str, Any]:
     logging.info("case start id=%s", case.id)
+    edge_checker = partial(verify_edge_with_llm, model_config=verifier_model_config)
     if mode == "direct":
-        output = run_stage("direct", run_direct, case, case_id=case.id)
+        output = run_stage(
+            "direct", run_direct, case, verifier_model_config, case_id=case.id
+        )
     else:
-        graph = run_stage("build_graph", build_graph, case, case_id=case.id)
+        graph = run_stage(
+            "build_graph", build_graph, case, verifier_model_config, case_id=case.id
+        )
         save_graph(artifact_dir, case.id, "build_graph", graph)
         if mode == "interrogation":
             graph = run_interrogation_verification(
@@ -121,7 +136,8 @@ def process_case(
                 graph,
                 artifact_dir,
                 max_interrogation_rounds,
-                verify_edge_with_llm,
+                edge_checker,
+                verifier_model_config,
             )
         else:
             graph = run_stage(
@@ -137,7 +153,7 @@ def process_case(
                 verify_graph,
                 case,
                 graph,
-                verify_edge_with_llm,
+                edge_checker,
                 case_id=case.id,
             )
             save_graph(artifact_dir, case.id, "verify_graph", graph)
@@ -153,6 +169,7 @@ def run_interrogation_verification(
     artifact_dir: Path,
     max_interrogation_rounds: int,
     edge_checker=verify_edge_with_llm,
+    verifier_model_config: str | Path = DEFAULT_MODEL_CONFIG,
 ) -> Graph:
     state = InterrogationState()
     feedback_cycle = 0
@@ -211,6 +228,7 @@ def run_interrogation_verification(
             max_interrogation_rounds,
             state,
             target,
+            verifier_model_config,
             case_id=case.id,
         )
         save_graph(artifact_dir, case.id, "interrogate", graph)
@@ -273,7 +291,10 @@ def save_graph(artifact_dir: Path, case_id: str, stage: str, graph: Graph) -> No
     write_json(path, graph.to_dict())
 
 
-def run_direct(case: Case) -> dict[str, Any]:
+def run_direct(
+    case: Case,
+    verifier_model_config: str | Path = DEFAULT_MODEL_CONFIG,
+) -> dict[str, Any]:
     try:
         data = complete_json(
             "direct.md",
@@ -282,6 +303,7 @@ def run_direct(case: Case) -> dict[str, Any]:
                 "agent_answer": case.agent_answer,
                 "agent_reasoning": case.agent_reasoning,
             },
+            verifier_model_config,
         )
         status = str(data.get("status", "tool_error"))
     except LLMError as exc:

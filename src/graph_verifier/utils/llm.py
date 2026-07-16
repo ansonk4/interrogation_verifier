@@ -15,7 +15,7 @@ class LLMError(RuntimeError):
 
 ROOT = Path(__file__).resolve().parents[3]
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
-DEFAULT_MODEL_CONFIG = ROOT / "model" / "openrouter" / "deepseek" / "deepseek-v4-flash-high.json"
+DEFAULT_MODEL_CONFIG = ROOT / "model" / "openrouter" / "tencent" / "hy3-high.json"
 DEFAULT_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 1.0
 

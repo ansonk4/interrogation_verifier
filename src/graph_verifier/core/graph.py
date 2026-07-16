@@ -23,7 +23,12 @@ from graph_verifier.core.verify import (
     is_edge_verifier_failure,
 )
 from graph_verifier.utils.artifacts import append_jsonl, case_name, write_json
-from graph_verifier.utils.llm import LLMError, complete_agent_json, complete_json
+from graph_verifier.utils.llm import (
+    DEFAULT_MODEL_CONFIG,
+    LLMError,
+    complete_agent_json,
+    complete_json,
+)
 
 
 class InterrogationUpdateResult(NamedTuple):
@@ -44,7 +49,10 @@ class InterrogationState:
     selection_checks: int = 0
 
 
-def build_graph(case: Case) -> Graph:
+def build_graph(
+    case: Case,
+    reviewer_model_config: str | Path = DEFAULT_MODEL_CONFIG,
+) -> Graph:
     if case.graph:
         try:
             graph = Graph.from_dict(case.graph)
@@ -66,6 +74,7 @@ def build_graph(case: Case) -> Graph:
                 "agent_answer": case.agent_answer,
                 "agent_reasoning": case.agent_reasoning,
             },
+            reviewer_model_config,
         )
         graph = Graph.from_dict(data)
         canonicalize_answer_node(case, graph)
@@ -81,6 +90,7 @@ def interrogate(
     max_rounds: int = 20,
     state: InterrogationState | None = None,
     forced_target: dict[str, object] | None = None,
+    reviewer_model_config: str | Path = DEFAULT_MODEL_CONFIG,
 ) -> Graph:
     if graph.tool_debt:
         return graph
@@ -104,7 +114,7 @@ def interrogate(
         else:
             try:
                 target_nodes, target_edges, target_coverage, review = find_interrogation_targets(
-                    case, graph
+                    case, graph, reviewer_model_config
                 )
             except (LLMError, KeyError, TypeError, ValueError) as exc:
                 graph.tool_debt.append(f"interrogation target selection failed: {exc}")
@@ -246,7 +256,9 @@ def interrogate(
         final_review: dict[str, object] | None = None
         state.selection_checks += 1
         try:
-            nodes, edges, coverage, final_review = find_interrogation_targets(case, graph)
+            nodes, edges, coverage, final_review = find_interrogation_targets(
+                case, graph, reviewer_model_config
+            )
             remaining = select_interrogation_target(
                 graph, nodes, edges, coverage, state.handled
             )
@@ -853,7 +865,11 @@ def graph_prompt_data(graph: Graph) -> dict[str, object]:
     }
 
 
-def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], list[Edge], bool, dict[str, object]]:
+def find_interrogation_targets(
+    case: Case,
+    graph: Graph,
+    reviewer_model_config: str | Path = DEFAULT_MODEL_CONFIG,
+) -> tuple[list[Node], list[Edge], bool, dict[str, object]]:
     answer_ids = matching_answer_ids(case, graph)
     answer_path_nodes, _ = answer_ancestry(graph, answer_ids)
     nodes_by_id = {node.id: node for node in graph.nodes}
@@ -946,6 +962,7 @@ def find_interrogation_targets(case: Case, graph: Graph) -> tuple[list[Node], li
                 "edges": heuristic_edge_ids,
             },
         },
+        reviewer_model_config,
     )
     reasons = review.get("reasons", {})
     if not isinstance(reasons, dict):

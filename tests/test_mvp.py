@@ -1,4 +1,5 @@
 import json
+from functools import partial
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,7 @@ from graph_verifier.core.aggregate import final_status
 from graph_verifier.core.graph import (
     InterrogationState,
     apply_interrogation_update,
+    build_graph,
     canonicalize_answer_node,
     interrogate,
     prepare_answer_candidates,
@@ -37,10 +39,11 @@ from graph_verifier.core.verify import (
 from graph_verifier.main import (
     compact_output,
     process_cases,
+    run_direct,
     run_interrogation_verification,
     validate_case_names,
 )
-from graph_verifier.utils.llm import LLMError, complete_json
+from graph_verifier.utils.llm import DEFAULT_MODEL_CONFIG, LLMError, complete_json
 
 
 QUESTION = (
@@ -48,6 +51,7 @@ QUESTION = (
     "Provider B costs 90 dollars for 30 units. Which provider is cheaper?"
 )
 AGENT_MODEL_CONFIG = "model/openrouter/hy3.json"
+REVIEWER_MODEL_CONFIG = "model/chatanywhere/gpt-5.4.json"
 
 
 def complete_graph(comparison: str = "2.5 < 3", answer: str = "A") -> Graph:
@@ -214,7 +218,7 @@ def test_interrogation_without_original_agent_marks_debt():
     graph = Graph(nodes=[Node("n1", "unsupported claim", "claim")])
     target_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls
         assert prompt_name == "interrogation_targets.md"
         target_calls += 1
@@ -246,7 +250,7 @@ def test_coverage_gap_anchors_to_only_answer_edge():
     )
     target_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls
         assert prompt_name == "interrogation_targets.md"
         target_calls += 1
@@ -290,8 +294,9 @@ def test_interrogation_uses_llm_targets():
     calls = []
     target_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls
+        assert model_config == REVIEWER_MODEL_CONFIG
         calls.append((prompt_name, data))
         assert prompt_name == "interrogation_targets.md"
         target_calls += 1
@@ -323,7 +328,7 @@ def test_interrogation_uses_llm_targets():
         patch("graph_verifier.core.graph.complete_json", side_effect=fake_reviewer),
         patch("graph_verifier.core.graph.complete_agent_json", side_effect=fake_agent),
     ):
-        interrogate(case, graph)
+        interrogate(case, graph, reviewer_model_config=REVIEWER_MODEL_CONFIG)
 
     assert [prompt_name for prompt_name, _ in calls] == [
         "interrogation_targets.md",
@@ -402,7 +407,7 @@ def test_interrogation_target_selection_sees_updates():
     )
     target_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls
         assert prompt_name == "interrogation_targets.md"
         target_calls += 1
@@ -467,7 +472,7 @@ def test_interrogation_repairs_ungrounded_query_target():
     reviewer_calls = 0
     agent_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal reviewer_calls
         assert prompt_name == "interrogation_targets.md"
         reviewer_calls += 1
@@ -532,7 +537,7 @@ def test_interrogation_repairs_unsupported_root_on_answer_path():
     )
     reviewer_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal reviewer_calls
         assert prompt_name == "interrogation_targets.md"
         reviewer_calls += 1
@@ -589,7 +594,7 @@ def test_changed_edge_can_be_refined():
     target_calls = 0
     agent_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls
         target_calls += 1
         if target_calls <= 2:
@@ -707,7 +712,7 @@ def test_interrogation_retries_orphan_node_with_rejection_reason():
     reviewer_calls = 0
     agent_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal reviewer_calls
         assert prompt_name == "interrogation_targets.md"
         reviewer_calls += 1
@@ -826,7 +831,7 @@ def test_interrogation_stops_at_max_rounds():
     target_calls = 0
     interrogation_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal target_calls, interrogation_calls
         assert prompt_name == "interrogation_targets.md"
         target_calls += 1
@@ -881,7 +886,7 @@ def test_interrogation_reports_debt_when_targets_remain_after_max_rounds():
     )
     graph = Graph(nodes=[Node(f"n{i}", f"claim {i}", "claim") for i in range(3)])
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         assert prompt_name == "interrogation_targets.md"
         return {"nodes": ["n0", "n1", "n2"], "edges": [], "coverage": False, "reasons": {}}
 
@@ -1058,7 +1063,8 @@ def test_symbolic_edge_verifier_gets_only_local_claims():
     )
     calls = []
 
-    def fake_complete_json(prompt_name, data):
+    def fake_complete_json(prompt_name, data, model_config):
+        assert model_config == REVIEWER_MODEL_CONFIG
         calls.append((prompt_name, data))
         return {
             "status": "valid",
@@ -1067,7 +1073,11 @@ def test_symbolic_edge_verifier_gets_only_local_claims():
         }
 
     with patch("graph_verifier.core.verify.complete_json", side_effect=fake_complete_json):
-        verify_graph(Case("case", question, "2", ""), graph, verify_edge_with_llm)
+        verify_graph(
+            Case("case", question, "2", ""),
+            graph,
+            partial(verify_edge_with_llm, model_config=REVIEWER_MODEL_CONFIG),
+        )
 
     assert calls == [
         (
@@ -1957,7 +1967,7 @@ def test_missing_query_target_is_deterministically_repaired():
     reviewer_calls = 0
     agent_calls = 0
 
-    def fake_reviewer(prompt_name, data):
+    def fake_reviewer(prompt_name, data, model_config):
         nonlocal reviewer_calls
         reviewer_calls += 1
         assert prompt_name == "interrogation_targets.md"
@@ -2246,9 +2256,18 @@ def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
     graph = verification_feedback_graph()
     calls = {"interrogate": 0, "candidates": 0, "verify": 0}
 
-    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+    def fake_interrogate(
+        case_arg,
+        graph_arg,
+        artifact_dir,
+        max_rounds,
+        state,
+        forced_target,
+        reviewer_model_config,
+    ):
         assert case_arg is case
         assert graph_arg is graph
+        assert reviewer_model_config == REVIEWER_MODEL_CONFIG
         calls["interrogate"] += 1
         assert forced_target is not None
         assert forced_target["target_id"] == "cause"
@@ -2286,6 +2305,7 @@ def test_feedback_pipeline_reuses_graph_and_reverifies_after_repair():
             Path("artifacts"),
             3,
             lambda *args: ClaimCheck("valid", "verified"),
+            REVIEWER_MODEL_CONFIG,
         )
 
     assert result is graph
@@ -2298,7 +2318,15 @@ def test_feedback_pipeline_enforces_one_global_repair_budget():
     graph = verification_feedback_graph()
     calls = {"interrogate": 0, "verify": 0}
 
-    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+    def fake_interrogate(
+        case_arg,
+        graph_arg,
+        artifact_dir,
+        max_rounds,
+        state,
+        forced_target,
+        reviewer_model_config,
+    ):
         calls["interrogate"] += 1
         if forced_target is not None:
             graph_arg.edges[0].claim += " changed"
@@ -2330,7 +2358,15 @@ def test_feedback_pipeline_stops_without_reverification_on_no_progress():
     graph = verification_feedback_graph()
     calls = {"interrogate": 0, "candidates": 0, "verify": 0}
 
-    def fake_interrogate(case_arg, graph_arg, artifact_dir, max_rounds, state, forced_target):
+    def fake_interrogate(
+        case_arg,
+        graph_arg,
+        artifact_dir,
+        max_rounds,
+        state,
+        forced_target,
+        reviewer_model_config,
+    ):
         calls["interrogate"] += 1
         assert forced_target is not None
         state.rounds_used += 1
@@ -2360,6 +2396,41 @@ def test_feedback_pipeline_stops_without_reverification_on_no_progress():
 
     assert calls == {"interrogate": 1, "candidates": 1, "verify": 1}
     assert graph.edges[0].verification.reason == "interrogation could not ground"
+
+
+def test_default_model_config_is_hy3_high():
+    assert DEFAULT_MODEL_CONFIG == (
+        Path(__file__).resolve().parents[1]
+        / "model"
+        / "openrouter"
+        / "tencent"
+        / "hy3-high.json"
+    )
+
+
+def test_verifier_model_config_reaches_graph_and_direct_reviewers():
+    case = Case("case", QUESTION, "A", "A is cheaper")
+    calls = []
+
+    def fake_complete_json(prompt_name, data, model_config):
+        calls.append((prompt_name, model_config))
+        if prompt_name == "graph_extract.md":
+            return {"nodes": [], "edges": [], "coverage_claim": "reviewed"}
+        return {"status": "verified_reliable", "reason": "reviewed"}
+
+    with (
+        patch("graph_verifier.core.graph.complete_json", side_effect=fake_complete_json),
+        patch("graph_verifier.main.complete_json", side_effect=fake_complete_json),
+    ):
+        graph = build_graph(case, REVIEWER_MODEL_CONFIG)
+        output = run_direct(case, REVIEWER_MODEL_CONFIG)
+
+    assert graph.coverage_claim == "reviewed"
+    assert output["status"] == "verified_reliable"
+    assert calls == [
+        ("graph_extract.md", REVIEWER_MODEL_CONFIG),
+        ("direct.md", REVIEWER_MODEL_CONFIG),
+    ]
 
 
 def test_complete_json_retries_a_malformed_response():
@@ -2443,11 +2514,19 @@ def test_case_processing_is_concurrent_bounded_and_ordered():
     active = 0
     peak = 0
 
-    def fake_process(case, *, mode, artifact_dir, max_interrogation_rounds):
+    def fake_process(
+        case,
+        *,
+        mode,
+        artifact_dir,
+        max_interrogation_rounds,
+        verifier_model_config,
+    ):
         nonlocal active, peak
         assert mode == "interrogation"
         assert artifact_dir == Path("artifacts")
         assert max_interrogation_rounds == 3
+        assert verifier_model_config == REVIEWER_MODEL_CONFIG
         assert case.agent_model_config == (
             "case-specific.json" if case.id == "first" else AGENT_MODEL_CONFIG
         )
@@ -2471,6 +2550,7 @@ def test_case_processing_is_concurrent_bounded_and_ordered():
                 3,
                 2,
                 AGENT_MODEL_CONFIG,
+                REVIEWER_MODEL_CONFIG,
             )
         )
 
@@ -2584,6 +2664,8 @@ if __name__ == "__main__":
         test_feedback_pipeline_reuses_graph_and_reverifies_after_repair,
         test_feedback_pipeline_enforces_one_global_repair_budget,
         test_feedback_pipeline_stops_without_reverification_on_no_progress,
+        test_default_model_config_is_hy3_high,
+        test_verifier_model_config_reaches_graph_and_direct_reviewers,
         test_complete_json_retries_a_malformed_response,
         test_complete_json_retries_null_content_with_backoff,
         test_compact_output_counts_only_decisive_items,

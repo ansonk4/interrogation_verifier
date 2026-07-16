@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
+from pathlib import Path
 
 from graph_verifier.core.models import (
     DEBT,
@@ -23,7 +24,7 @@ from graph_verifier.core.models import (
     graph_id_error,
     parse_answer_value,
 )
-from graph_verifier.utils.llm import LLMError, complete_json
+from graph_verifier.utils.llm import DEFAULT_MODEL_CONFIG, LLMError, complete_json
 
 
 _NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?")
@@ -362,7 +363,13 @@ def verify_edge(
     return verification, target_check
 
 
-def verify_edge_with_llm(premises: list[Node], edge: Edge, target: Node) -> ClaimCheck:
+def verify_edge_with_llm(
+    premises: list[Node],
+    edge: Edge,
+    target: Node,
+    *,
+    model_config: str | Path = DEFAULT_MODEL_CONFIG,
+) -> ClaimCheck:
     data = complete_json(
         "verify_edge.md",
         {
@@ -372,6 +379,7 @@ def verify_edge_with_llm(premises: list[Node], edge: Edge, target: Node) -> Clai
             "edge_claim": edge.claim,
             "target_claim": target.claim,
         },
+        model_config,
     )
     if not isinstance(data, dict):
         return ClaimCheck(DEBT, "edge verifier failed: response is not an object")
